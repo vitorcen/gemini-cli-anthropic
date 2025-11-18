@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "outDir": "./dist",
+    "baseUrl": ".",
+    "paths": {
+      "@google/gemini-cli-core": ["./gemini-cli/packages/core/src/index.ts"],
+      "@google/gemini-cli-core/*": ["./gemini-cli/packages/core/src/*"],
+      "@a2a/config/*": ["./gemini-cli/packages/a2a-server/src/config/*"],
+      "@a2a/utils/*": ["./gemini-cli/packages/a2a-server/src/utils/*"]
+    }
+  },
+  "ts-node": {
+    "esm": true,
+    "experimentalSpecifierResolution": "node"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "gemini-cli"]
+}

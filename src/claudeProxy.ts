@@ -1,0 +1,532 @@
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import type express from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import type { Config } from '@google/gemini-cli-core';
+import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, GeminiEventType } from '@google/gemini-cli-core';
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-pro';
+import type { Content } from '@google/generative-ai';
+import { logger } from './utils/logger';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+const formatTokenCount = (value?: number): string =>
+  typeof value === 'number' ? value.toLocaleString('en-US') : '0';
+
+const sumTokenCounts = (...values: Array<number | undefined>): number => {
+  let total = 0;
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      total += value;
+    }
+  }
+  return total;
+};
+
+interface ClaudeContentBlock {
+  type: 'text' | 'tool_use' | 'tool_result';
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, any>;
+  tool_use_id?: string;
+  content?: string;
+}
+
+interface ClaudeMessage {
+  role: 'user' | 'assistant';
+  content: ClaudeContentBlock[] | string;
+}
+
+interface ClaudeRequest {
+  model?: string;
+  messages: ClaudeMessage[];
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  stream?: boolean;
+  system?: Array<{
+    type: 'text';
+    text: string;
+  }> | string;
+  tools?: Array<{
+    name: string;
+    description?: string;
+    input_schema?: {
+      type: string;
+      properties?: Record<string, any>;
+      required?: string[];
+    };
+  }>;
+}
+
+/**
+ * Clean JSON Schema by removing metadata fields that Gemini API doesn't accept
+ */
+function cleanSchema(schema: any): any {
+  if (!schema || typeof schema !== 'object') return schema;
+
+  // Remove JSON Schema metadata fields
+  const { $schema, $id, $ref, $comment, definitions, $defs, ...rest } = schema;
+
+  // Recursively clean nested objects
+  const cleaned: any = {};
+  for (const [key, value] of Object.entries(rest)) {
+    if (key === 'properties' && typeof value === 'object') {
+      cleaned[key] = {};
+      for (const [propKey, propValue] of Object.entries(value as any)) {
+        cleaned[key][propKey] = cleanSchema(propValue);
+      }
+    } else if (key === 'items' && typeof value === 'object') {
+      cleaned[key] = cleanSchema(value);
+    } else if (key === 'additionalProperties' && typeof value === 'object') {
+      cleaned[key] = cleanSchema(value);
+    } else if (Array.isArray(value)) {
+      cleaned[key] = value.map(item => typeof item === 'object' ? cleanSchema(item) : item);
+    } else {
+      cleaned[key] = value;
+    }
+  }
+
+  return cleaned;
+}
+
+/**
+ * Map Claude model names to Gemini model names
+ */
+function mapModelName(requestedModel: string | undefined): string {
+  if (!requestedModel) return DEFAULT_GEMINI_FLASH_MODEL;
+
+  const lowerModel = requestedModel.toLowerCase();
+
+  // Models containing "sonnet" or "opus" -> DEFAULT_GEMINI_MODEL
+  if (lowerModel.includes('sonnet') || lowerModel.includes('opus')) {
+    return DEFAULT_GEMINI_MODEL;
+  }
+
+  // Models containing "haiku" -> DEFAULT_GEMINI_FLASH_MODEL
+  // Claude code auto req the Kaiku model based on user input to determine if it's a new topic and extract a title
+  if (lowerModel.includes('haiku')) {
+    return DEFAULT_GEMINI_FLASH_MODEL;
+  }
+
+  // Other claude-* models -> flash
+  if (requestedModel.startsWith('claude-')) {
+    return DEFAULT_GEMINI_FLASH_MODEL;
+  }
+
+  // Pass through everything else (gemini-*, gpt-*, etc.)
+  return requestedModel;
+}
+
+/**
+ * Filter out thought parts and thoughtSignature from response to save context space
+ */
+
+function filterThoughtParts(parts: any[]): any[] {
+  return parts
+    .filter(p => !p.thought)  // Filter parts with thought: true
+    .map(p => {
+      // Remove thoughtSignature field from each part
+      const { thoughtSignature, ...rest } = p;
+      return rest;
+    });
+}
+
+/**
+ * Write debug log when DEBUG_LOG_REQUESTS is set
+ */
+async function writeDebugLog(
+  requestId: string,
+  type: string,
+  data: Record<string, unknown>,
+): Promise<void> {
+  if (!process.env['DEBUG_LOG_REQUESTS']) {
+    return;
+  }
+
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `claude-proxy-${type}-${requestId}-${timestamp}.json`;
+    const filepath = path.join(os.tmpdir(), filename);
+    await fs.writeFile(filepath, JSON.stringify(data, null, 2));
+    logger.debug(`[CLAUDE_PROXY][${requestId}] Debug log written to: ${filepath}`);
+  } catch (error) {
+    logger.error(`[CLAUDE_PROXY][${requestId}] Failed to write debug log:`, error);
+  }
+}
+
+/**
+ * Merge consecutive contents from the same role to satisfy Gemini API requirements
+ */
+function mergeConsecutiveContents(contents: Content[]): Content[] {
+  if (contents.length === 0) return [];
+
+  const merged: Content[] = [{
+    role: contents[0].role,
+    parts: [...(contents[0].parts || [])]
+  }];
+
+  for (let i = 1; i < contents.length; i++) {
+    const current = contents[i];
+    const last = merged[merged.length - 1];
+
+    if (current.role === last.role) {
+      // Same role, merge parts
+      last.parts = [...(last.parts || []), ...(current.parts || [])];
+    } else {
+      // Different role, add new content
+      merged.push({
+        role: current.role,
+        parts: [...(current.parts || [])]
+      });
+    }
+  }
+
+  return merged;
+}
+
+export function registerClaudeEndpoints(app: express.Router, defaultConfig: Config) {
+  // Claude-compatible /v1/messages endpoint
+  app.post('/messages', async (req: express.Request, res: express.Response) => {
+    try {
+      const headerRequestId = req.headers['x-request-id'];
+      const requestId =
+        typeof headerRequestId === 'string' && headerRequestId.trim().length > 0
+          ? headerRequestId
+          : uuidv4();
+      const body = (req.body ?? {}) as ClaudeRequest;
+
+      // Debug: Log tools if present
+      if (body.tools !== undefined) {
+        logger.debug(`[CLAUDE_PROXY][${requestId}] Received tools: ${JSON.stringify(body.tools)}`);
+      }
+
+      if (!Array.isArray(body.messages)) {
+        throw new Error('`messages` must be an array.');
+      }
+      const stream = false; // Boolean(body.stream);
+      const model = mapModelName(body.model);
+
+      // Check for X-Working-Directory header to support per-request working directory
+      const workingDirectory = req.headers['x-working-directory'] as string | undefined;
+      let config = defaultConfig;
+
+      if (workingDirectory) {
+        // Create a new config with the specified working directory
+        const { loadConfig } = await import('@a2a/config/config.js');
+        const { loadSettings } = await import('@a2a/config/settings.js');
+        const settings = loadSettings(workingDirectory);
+        const extensionLoader = new SimpleExtensionLoader([]);
+        config = await loadConfig(settings, extensionLoader, req.headers['x-request-id'] as string || Date.now().toString());
+      }
+
+      // Extract parameters
+      const temperature = body.temperature;
+      const topP = body.top_p;
+      const maxOutputTokens = body.max_tokens || 4096;
+
+      // Build Gemini-compatible contents array with tool support
+      const unprocessedContents: Content[] = [];
+      const toolUseMap = new Map<string, string>(); // tool_use_id -> name
+
+      for (const message of body.messages) {
+        if (typeof message.content === 'string') {
+          // Simple text message
+          unprocessedContents.push({
+            role: message.role === 'assistant' ? 'model' : 'user',
+            parts: [{ text: message.content }]
+          });
+        } else {
+          // Structured content blocks
+          const parts: any[] = [];
+
+          for (const block of message.content) {
+            if (block.type === 'text' && block.text) {
+              parts.push({ text: block.text });
+            } else if (block.type === 'tool_use' && block.id && block.name) {
+              // Assistant tool call -> Gemini functionCall
+              toolUseMap.set(block.id, block.name);
+              parts.push({
+                functionCall: {
+                  name: block.name,
+                  args: block.input || {}
+                }
+              });
+            } else if (block.type === 'tool_result' && block.tool_use_id) {
+              // User tool result -> Gemini functionResponse
+              const toolName = toolUseMap.get(block.tool_use_id) || 'unknown';
+              parts.push({
+                functionResponse: {
+                  name: toolName,
+                  response: { result: block.content || '' }
+                }
+              });
+            }
+          }
+
+          if (parts.length > 0) {
+            unprocessedContents.push({
+              role: message.role === 'assistant' ? 'model' : 'user',
+              parts
+            });
+          }
+        }
+      }
+
+      // Different processing logic for streaming vs non-streaming requests
+      // Non-streaming requests (e.g., title generation) should not merge or modify messages
+      // Streaming requests (normal conversation) should merge consecutive same-role messages
+      let contents: Content[];
+      if (stream) {
+        // Streaming: merge consecutive contents from the same role to ensure API compliance
+        contents = mergeConsecutiveContents(unprocessedContents);
+      } else {
+        // Non-streaming: use messages as-is without merging to avoid contamination
+        contents = unprocessedContents;
+      }
+
+      // Ensure we have at least one message to send
+      if (contents.length === 0) {
+        throw new Error('No valid messages to send to the model');
+      }
+
+      // Handle system prompt and tools
+      let systemInstruction: Content | undefined;
+      if (body.system) {
+        const systemContent =
+          typeof body.system === 'string'
+            ? body.system
+            : body.system.map((s: any) => s.text).join('\n');
+        systemInstruction = { parts: [{ text: systemContent }], role: 'system' };
+      }
+
+      const tools = body.tools && body.tools.length > 0
+        ? [{ functionDeclarations: body.tools.map(t => ({
+            name: t.name,
+            description: t.description || '',
+            parameters: cleanSchema(t.input_schema)
+          })) }]
+        : undefined;
+
+      if (stream) {
+        // SSE streaming response
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        // @ts-ignore
+        res.flushHeaders && res.flushHeaders();
+
+        try {
+          // Use CCPA mode with rawGenerateContentStream
+          const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+          logger.info(
+            `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB`,
+          );
+          const lastUserMessage = contents.filter(c => c.role === 'user').pop();
+          const requestParts = lastUserMessage?.parts || [];
+          const streamGen = await config.getGeminiClient().sendMessageStream(
+            requestParts,
+            new AbortController().signal,
+            requestId
+          );
+
+          const writeEvent = (event: string, data: object) => {
+            res.write(`event: ${event}\n`);
+            res.write(`data: ${JSON.stringify(data)}\n\n`);
+          };
+
+          const messageId = `msg_${uuidv4()}`;
+
+          let currentBlockType: 'text' | 'tool_use' | null = null;
+          let currentContentIndex = -1;
+
+          const stopCurrentBlock = () => {
+            if (!currentBlockType) return;
+            writeEvent('content_block_stop', {
+              type: 'content_block_stop',
+              index: currentContentIndex,
+            });
+            currentBlockType = null;
+          };
+
+          let accumulatedText = '';
+          const debugChunks: any[] = [];
+
+          // Send message_start immediately
+          writeEvent('message_start', {
+            type: 'message_start',
+            message: {
+              id: messageId,
+              type: 'message',
+              role: 'assistant',
+              model,
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
+          });
+
+          for await (const event of streamGen) {
+            // Collect events for debug logging
+            if (process.env['DEBUG_LOG_REQUESTS']) {
+              debugChunks.push(event);
+            }
+
+            // Handle different event types from sendMessageStream
+            switch (event.type) {
+              case GeminiEventType.Content:
+                // Text chunk received
+                if (currentBlockType !== 'text') {
+                  stopCurrentBlock();
+                  currentContentIndex++;
+                  currentBlockType = 'text';
+                  writeEvent('content_block_start', {
+                    type: 'content_block_start',
+                    index: currentContentIndex,
+                    content_block: { type: 'text', text: '' },
+                  });
+                }
+                const textDelta = (event as any).value || '';
+                accumulatedText += textDelta;
+                writeEvent('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: currentContentIndex,
+                  delta: { type: 'text_delta', text: textDelta },
+                });
+                break;
+
+              case GeminiEventType.ToolCallRequest:
+                // Tool call request received
+                stopCurrentBlock();
+                currentContentIndex++;
+                currentBlockType = 'tool_use';
+                const toolId = `toolu_${uuidv4()}`;
+                const toolCallRequest = (event as any).value;
+                writeEvent('content_block_start', {
+                  type: 'content_block_start',
+                  index: currentContentIndex,
+                  content_block: { type: 'tool_use', id: toolId, name: toolCallRequest.name, input: {} },
+                });
+                writeEvent('content_block_delta', {
+                  type: 'content_block_delta',
+                  index: currentContentIndex,
+                  delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolCallRequest.args || {}) },
+                });
+                stopCurrentBlock();
+                break;
+
+              case GeminiEventType.Error:
+                // Error occurred
+                logger.error(`[CLAUDE_PROXY][${requestId}] Stream error:`, (event as any).value);
+                break;
+
+              // Ignore other event types for now
+              default:
+                break;
+            }
+          }
+
+          stopCurrentBlock();
+
+          writeEvent('message_delta', {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn', stop_sequence: null },
+            usage: { output_tokens: 0 },
+          });
+
+          logger.info(
+            `[CLAUDE_PROXY][${requestId}] model=${model} stream completed`,
+          );
+
+          // Send message_stop event
+          res.write(`event: message_stop\n`);
+          res.write(`data: ${JSON.stringify({
+            type: 'message_stop',
+          })}\n\n`);
+
+          // Write debug log with all events if DEBUG_LOG_REQUESTS is set
+          await writeDebugLog(requestId, 'stream', {
+            request: {
+              contents,
+              model,
+            },
+            response: {
+              events: debugChunks,
+              accumulatedText,
+            },
+          });
+
+          return res.end();
+        } catch (err) {
+          const errorMsg = (err as Error).message || 'Stream error';
+          res.write(`event: error\n`);
+          res.write(`data: ${JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'api_error',
+              message: errorMsg,
+            },
+          })}\n\n`);
+          return res.end();
+        }
+      } else {
+        // Non-streaming response - Using CCPA mode with rawGenerateContent
+        const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        logger.info(
+          `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB`,
+        );
+        const response = await config.getGeminiClient().generateContent(
+          { model },
+          contents,
+          new AbortController().signal
+        );
+
+        // This part needs to be completely rewritten to adapt the new response format
+        const usage = (response as any).usageMetadata;
+        const content: any[] = [];
+        const text = response.candidates?.[0].content.parts.map((p: any) => 'text' in p ? p.text : '').join('') || '';
+        if (text) {
+          content.push({ type: 'text', text });
+        }
+
+        const result = {
+          id: `msg_${uuidv4()}`,
+          type: 'message',
+          role: 'assistant',
+          model,
+          content,
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: {
+            input_tokens: usage?.promptTokenCount || 0,
+            output_tokens: usage?.candidatesTokenCount || 0,
+          },
+        };
+
+        const totalTokens = sumTokenCounts(usage?.promptTokenCount, usage?.candidatesTokenCount);
+        logger.info(
+          `[CLAUDE_PROXY][${requestId}] model=${model} usage: prompt=${formatTokenCount(usage?.promptTokenCount)} completion=${formatTokenCount(usage?.candidatesTokenCount)} total=${formatTokenCount(totalTokens)} tokens`,
+        );
+
+        return res.status(200).json(result);
+
+      }
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : 'Bad request';
+      return res.status(400).json({
+        error: {
+          type: 'api_error',
+          message,
+        },
+      });
+    }
+  });
+}
