@@ -1,11 +1,19 @@
 import express from 'express';
 import { registerClaudeEndpoints } from './claudeProxy';
 import { logger } from './utils/logger';
-import { loadConfig } from '@a2a/config/config.js';
+import { loadConfig, loadEnvironment } from '@a2a/config/config.js';
 import { loadSettings } from '@a2a/config/settings.js';
 import { SimpleExtensionLoader } from '@google/gemini-cli-core';
 
 async function main() {
+  // Set default environment variables if not present
+  if (!process.env.USE_CCPA && !process.env.GEMINI_API_KEY) {
+    process.env.USE_CCPA = 'true';
+    logger.info('Defaulting to USE_CCPA=true for authentication.');
+  }
+  // Load environment variables from .env file
+  loadEnvironment();
+
   const app = express();
   const port = process.env.PORT || 3000;
 

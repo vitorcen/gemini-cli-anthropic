@@ -41,13 +41,18 @@ npm start
 
 The server will listen on port 3000 by default (configurable via `PORT` environment variable).
 
-## Environment Variables
+## Authentication
+
+By default, the server authenticates using Google Cloud Platform (GCP) credentials (`USE_CCPA=true`). Ensure your environment is configured for GCP authentication (e.g., by running `gcloud auth application-default login`).
+
+Alternatively, you can use a Gemini API key by setting the `GEMINI_API_KEY` environment variable.
+
+### Environment Variables
 
 - `PORT`: Server port (default: 3000)
-- `GEMINI_API_KEY`: Your Google Gemini API key
-- `USE_CCPA`: Set to `true` to use Google Cloud credentials instead of API key
-- `GOOGLE_APPLICATION_CREDENTIALS`: Path to your Google Cloud credentials file (if using CCPA)
-- `DEBUG_LOG_REQUESTS`: Set to `true` to enable debug logging
+- `GEMINI_API_KEY`: Your Google Gemini API key. If provided, this will be used for authentication instead of the default GCP method.
+- `GOOGLE_APPLICATION_CREDENTIALS`: Path to your Google Cloud credentials file (if needed).
+- `DEBUG_LOG_REQUESTS`: Set to `true` to enable detailed request/response logging.
 
 ## Update Submodule (if needed)
 
