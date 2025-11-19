@@ -194,12 +194,12 @@ function mergeConsecutiveContents(contents: Content[]): Content[] {
 export function registerClaudeEndpoints(app: express.Router, defaultConfig: Config) {
   // Claude-compatible /v1/messages endpoint
   app.post('/messages', async (req: express.Request, res: express.Response) => {
-    try {
-      const headerRequestId = req.headers['x-request-id'];
-      const requestId =
+    const headerRequestId = req.headers['x-request-id'];
+    const requestId =
         typeof headerRequestId === 'string' && headerRequestId.trim().length > 0
           ? headerRequestId
           : uuidv4();
+    try {
       const body = (req.body ?? {}) as ClaudeRequest;
 
       // Debug: Log tools if present
@@ -210,7 +210,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
       if (!Array.isArray(body.messages)) {
         throw new Error('`messages` must be an array.');
       }
-      const stream = false; // Boolean(body.stream);
+      const stream = Boolean(body.stream);
       const model = mapModelName(body.model);
 
       // Check for X-Working-Directory header to support per-request working directory
@@ -296,7 +296,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         throw new Error('No valid messages to send to the model');
       }
 
-      // Handle system prompt and tools
+      // Handle system prompt
       let systemInstruction: Content | undefined;
       if (body.system) {
         const systemContent =
@@ -306,13 +306,24 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         systemInstruction = { parts: [{ text: systemContent }], role: 'system' };
       }
 
-      const tools = body.tools && body.tools.length > 0
-        ? [{ functionDeclarations: body.tools.map(t => ({
+      // Handle tools
+      const client = config.getGeminiClient();
+      if (!client.isInitialized()) {
+        await client.initialize();
+      }
+
+      if (body.tools && body.tools.length > 0) {
+          const functionDeclarations = body.tools.map(t => ({
             name: t.name,
             description: t.description || '',
             parameters: cleanSchema(t.input_schema)
-          })) }]
-        : undefined;
+          }));
+          // Set tools on the underlying chat session
+          client.getChat().setTools([{ functionDeclarations }]);
+      } else {
+          // Clear tools if none provided
+          client.getChat().setTools([]);
+      }
 
       if (stream) {
         // SSE streaming response
@@ -329,7 +340,16 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           logger.info(
             `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB`,
           );
-          const lastUserMessage = contents.filter(c => c.role === 'user').pop();
+          
+          // Split contents into history and new message for stateful streaming
+          const history = contents.slice(0, -1);
+          const lastUserMessage = contents[contents.length - 1];
+          
+          // Sync client history with request history
+          logger.info(`[CLAUDE_PROXY][${requestId}] Setting history: ${JSON.stringify(history)}`);
+          logger.info(`[CLAUDE_PROXY][${requestId}] Last message: ${JSON.stringify(lastUserMessage)}`);
+          config.getGeminiClient().setHistory(history);
+
           const requestParts = lastUserMessage?.parts || [];
           const streamGen = await config.getGeminiClient().sendMessageStream(
             requestParts,
@@ -492,7 +512,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         // This part needs to be completely rewritten to adapt the new response format
         const usage = (response as any).usageMetadata;
         const content: any[] = [];
-        const text = response.candidates?.[0].content.parts.map((p: any) => 'text' in p ? p.text : '').join('') || '';
+        const text = response.candidates?.[0]?.content?.parts?.map((p: any) => 'text' in p ? p.text : '').join('') || '';
         if (text) {
           content.push({ type: 'text', text });
         }
@@ -521,6 +541,8 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : 'Bad request';
+      const stack = e instanceof Error ? e.stack : '';
+      logger.error(`[CLAUDE_PROXY][${requestId}] Request failed: ${message}`, stack);
       return res.status(400).json({
         error: {
           type: 'api_error',
