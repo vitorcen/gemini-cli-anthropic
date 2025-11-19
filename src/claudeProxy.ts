@@ -7,8 +7,7 @@
 import type express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import type { Config } from '@google/gemini-cli-core';
-import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, GeminiEventType } from '@google/gemini-cli-core';
-const DEFAULT_GEMINI_MODEL = 'gemini-2.5-pro';
+import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, DEFAULT_GEMINI_MODEL } from '@google/gemini-cli-core';
 import type { Content } from '@google/generative-ai';
 import { logger } from './utils/logger';
 import fs from 'node:fs/promises';
@@ -50,11 +49,11 @@ interface ClaudeRequest {
   temperature?: number;
   top_p?: number;
   stream?: boolean;
-  system?: Array<{
+  system?: Array <{
     type: 'text';
     text: string;
   }> | string;
-  tools?: Array<{
+  tools?: Array <{
     name: string;
     description?: string;
     input_schema?: {
@@ -222,8 +221,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         const { loadConfig } = await import('@a2a/config/config.js');
         const { loadSettings } = await import('@a2a/config/settings.js');
         const settings = loadSettings(workingDirectory);
-        const extensionLoader = new SimpleExtensionLoader([]);
-        config = await loadConfig(settings, extensionLoader, req.headers['x-request-id'] as string || Date.now().toString());
+        config = await loadConfig(settings, new SimpleExtensionLoader([]), req.headers['x-request-id'] as string || Date.now().toString());
       }
 
       // Extract parameters
@@ -296,7 +294,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         throw new Error('No valid messages to send to the model');
       }
 
-      // Handle system prompt
+      // Handle system prompt and tools
       let systemInstruction: Content | undefined;
       if (body.system) {
         const systemContent =
@@ -306,24 +304,13 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         systemInstruction = { parts: [{ text: systemContent }], role: 'system' };
       }
 
-      // Handle tools
-      const client = config.getGeminiClient();
-      if (!client.isInitialized()) {
-        await client.initialize();
-      }
-
-      if (body.tools && body.tools.length > 0) {
-          const functionDeclarations = body.tools.map(t => ({
+      const tools = body.tools && body.tools.length > 0
+        ? [{ functionDeclarations: body.tools.map(t => ({
             name: t.name,
             description: t.description || '',
             parameters: cleanSchema(t.input_schema)
-          }));
-          // Set tools on the underlying chat session
-          client.getChat().setTools([{ functionDeclarations }]);
-      } else {
-          // Clear tools if none provided
-          client.getChat().setTools([]);
-      }
+          })) }]
+        : undefined;
 
       if (stream) {
         // SSE streaming response
@@ -335,28 +322,42 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         res.flushHeaders && res.flushHeaders();
 
         try {
-          // Use CCPA mode with rawGenerateContentStream
+          // Use ContentGenerator directly to bypass Turn logic
           const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
           logger.info(
             `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB`,
           );
-          
-          // Split contents into history and new message for stateful streaming
-          const history = contents.slice(0, -1);
-          const lastUserMessage = contents[contents.length - 1];
-          
-          // Sync client history with request history
-          logger.info(`[CLAUDE_PROXY][${requestId}] Setting history: ${JSON.stringify(history)}`);
-          logger.info(`[CLAUDE_PROXY][${requestId}] Last message: ${JSON.stringify(lastUserMessage)}`);
-          config.getGeminiClient().setHistory(history);
 
-          const requestParts = lastUserMessage?.parts || [];
-          const streamGen = await config.getGeminiClient().sendMessageStream(
-            requestParts,
-            new AbortController().signal,
-            requestId
+          if (process.env.CLAUDE_PROXY_LOG_DIR) {
+            try {
+              const logPath = path.join(process.env.CLAUDE_PROXY_LOG_DIR, `gemini-cli-anthropic-${requestId}.txt`);
+              const logContent = `[${new Date().toISOString()}] Request model=${model} stream=true\nSystem: ${JSON.stringify(systemInstruction, null, 2)}\nTools: ${JSON.stringify(tools, null, 2)}\nContents:\n${JSON.stringify(contents, null, 2)}\n\n`;
+              await fs.appendFile(logPath, logContent);
+            } catch (e) {
+              // Ignore logging errors
+            }
+          }
+          
+          const streamGen = await config.getContentGenerator().generateContentStream(
+            {
+              model,
+              contents: contents as any, // Cast to any to avoid potential type mismatches between SDK versions
+              config: {
+                temperature,
+                topP,
+                maxOutputTokens,
+                ...(tools && { tools: tools as any }),
+                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
+              }
+            },
+            requestId // prompt_id
           );
 
+          let outputTokens = 0;
+          let inputTokens = 0;
+          let thinkingTokens = 0;
+          let firstChunk = true;
+          
           const writeEvent = (event: string, data: object) => {
             res.write(`event: ${event}\n`);
             res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -376,81 +377,104 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             currentBlockType = null;
           };
 
+          const startTextBlock = () => {
+            if (currentBlockType === 'text') return;
+            stopCurrentBlock();
+            currentContentIndex++;
+            currentBlockType = 'text';
+            writeEvent('content_block_start', {
+              type: 'content_block_start',
+              index: currentContentIndex,
+              content_block: { type: 'text', text: '' },
+            });
+          };
+
           let accumulatedText = '';
+          let messageStartSent = false;
           const debugChunks: any[] = [];
 
-          // Send message_start immediately
-          writeEvent('message_start', {
-            type: 'message_start',
-            message: {
-              id: messageId,
-              type: 'message',
-              role: 'assistant',
-              model,
-              content: [],
-              stop_reason: null,
-              stop_sequence: null,
-              usage: { input_tokens: 0, output_tokens: 0 },
-            },
-          });
-
-          for await (const event of streamGen) {
-            // Collect events for debug logging
+          for await (const chunkResp of streamGen) {
+            // Collect chunks for debug logging
             if (process.env['DEBUG_LOG_REQUESTS']) {
-              debugChunks.push(event);
+              debugChunks.push(chunkResp);
             }
 
-            // Handle different event types from sendMessageStream
-            switch (event.type) {
-              case GeminiEventType.Content:
-                // Text chunk received
-                if (currentBlockType !== 'text') {
-                  stopCurrentBlock();
-                  currentContentIndex++;
-                  currentBlockType = 'text';
-                  writeEvent('content_block_start', {
-                    type: 'content_block_start',
-                    index: currentContentIndex,
-                    content_block: { type: 'text', text: '' },
-                  });
-                }
-                const textDelta = (event as any).value || '';
+            // Update usage tokens
+            const usage = (chunkResp as any).usageMetadata;
+            if (usage) {
+                if (usage.promptTokenCount !== undefined) inputTokens = usage.promptTokenCount;
+                if (usage.candidatesTokenCount !== undefined) outputTokens = usage.candidatesTokenCount;
+                // Check for thinking tokens in various possible fields
+                const thoughtCount = usage.thoughtsTokenCount ?? usage.thoughts_token_count ?? usage.thinking_token_count;
+                if (thoughtCount !== undefined) thinkingTokens = thoughtCount;
+            }
+
+            // Send message_start on first chunk (with whatever token info we have)
+            if (!messageStartSent && firstChunk) {
+              messageStartSent = true;
+              firstChunk = false;
+
+              writeEvent('message_start', {
+                type: 'message_start',
+                message: {
+                  id: messageId,
+                  type: 'message',
+                  role: 'assistant',
+                  model,
+                  content: [],
+                  stop_reason: null,
+                  stop_sequence: null,
+                  usage: { input_tokens: inputTokens, output_tokens: 0 },
+                },
+              });
+            }
+
+            // Filter thought parts from chunk
+            const rawParts = chunkResp.candidates?.[0]?.content?.parts || [];
+            const filteredParts = filterThoughtParts(rawParts);
+
+            // Extract text from this chunk's parts
+            const textParts = filteredParts.filter((p: any) => p.text && !p.functionCall);
+            if (textParts.length > 0) {
+              // Gemini may send cumulative or incremental text depending on model/mode, 
+              // but generateContentStream usually gives incremental chunks for text.
+              // However, if it acts weird, we handle it.
+              // Actually, standard Gemini stream gives incremental text.
+              const textDelta = textParts.map((p: any) => p.text).join('');
+              
+              if (textDelta.length > 0) {
                 accumulatedText += textDelta;
+                startTextBlock();
                 writeEvent('content_block_delta', {
                   type: 'content_block_delta',
                   index: currentContentIndex,
                   delta: { type: 'text_delta', text: textDelta },
                 });
-                break;
+              }
+            }
 
-              case GeminiEventType.ToolCallRequest:
-                // Tool call request received
-                stopCurrentBlock();
-                currentContentIndex++;
-                currentBlockType = 'tool_use';
-                const toolId = `toolu_${uuidv4()}`;
-                const toolCallRequest = (event as any).value;
-                writeEvent('content_block_start', {
-                  type: 'content_block_start',
-                  index: currentContentIndex,
-                  content_block: { type: 'tool_use', id: toolId, name: toolCallRequest.name, input: {} },
-                });
-                writeEvent('content_block_delta', {
-                  type: 'content_block_delta',
-                  index: currentContentIndex,
-                  delta: { type: 'input_json_delta', partial_json: JSON.stringify(toolCallRequest.args || {}) },
-                });
-                stopCurrentBlock();
-                break;
-
-              case GeminiEventType.Error:
-                // Error occurred
-                logger.error(`[CLAUDE_PROXY][${requestId}] Stream error:`, (event as any).value);
-                break;
-
-              // Ignore other event types for now
-              default:
-                break;
+            // Handle structured function calls
+            const functionCalls = filteredParts.filter((p: any) => p.functionCall);
+            if (functionCalls && functionCalls.length > 0) {
+              for (const part of functionCalls) {
+                if (part.functionCall) {
+                  stopCurrentBlock();
+                  currentContentIndex++;
+                  currentBlockType = 'tool_use';
+                  const toolId = `toolu_${uuidv4()}`;
+                  writeEvent('content_block_start', {
+                    type: 'content_block_start',
+                    index: currentContentIndex,
+                    content_block: { type: 'tool_use', id: toolId, name: part.functionCall.name, input: {} },
+                  });
+                  writeEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: currentContentIndex,
+                    delta: { type: 'input_json_delta', partial_json: JSON.stringify(part.functionCall.args) },
+                  });
+                  stopCurrentBlock();
+                }
+              }
             }
           }
 
@@ -459,11 +483,17 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           writeEvent('message_delta', {
             type: 'message_delta',
             delta: { stop_reason: 'end_turn', stop_sequence: null },
-            usage: { output_tokens: 0 },
+            usage: { output_tokens: outputTokens },
           });
 
+          const totalTokens = sumTokenCounts(inputTokens, outputTokens, thinkingTokens);
+          const promptStr = `prompt=${formatTokenCount(inputTokens)}`;
+          const thinkingStr = thinkingTokens ? ` thinking=${formatTokenCount(thinkingTokens)}` : '';
+          const outputStr = `output=${formatTokenCount(outputTokens)}`;
+          const totalStr = `total=${formatTokenCount(totalTokens)}`;
+          
           logger.info(
-            `[CLAUDE_PROXY][${requestId}] model=${model} stream completed`,
+            `[CLAUDE_PROXY][${requestId}] model=${model} usage: ${promptStr}${thinkingStr} ${outputStr} ${totalStr} tokens`,
           );
 
           // Send message_stop event
@@ -472,15 +502,28 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             type: 'message_stop',
           })}\n\n`);
 
-          // Write debug log with all events if DEBUG_LOG_REQUESTS is set
+          // Write debug log
           await writeDebugLog(requestId, 'stream', {
             request: {
               contents,
+              config: {
+                temperature,
+                topP,
+                maxOutputTokens,
+                tools,
+                systemInstruction,
+              },
               model,
             },
             response: {
-              events: debugChunks,
+              chunks: debugChunks,
               accumulatedText,
+              usage: {
+                inputTokens,
+                outputTokens,
+                thinkingTokens,
+                totalTokens,
+              },
             },
           });
 
@@ -498,24 +541,66 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           return res.end();
         }
       } else {
-        // Non-streaming response - Using CCPA mode with rawGenerateContent
+        // Non-streaming response
         const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         logger.info(
           `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB`,
         );
-        const response = await config.getGeminiClient().generateContent(
-          { model },
-          contents,
-          new AbortController().signal
+
+        if (process.env.CLAUDE_PROXY_LOG_DIR) {
+          try {
+            const logPath = path.join(process.env.CLAUDE_PROXY_LOG_DIR, `gemini-cli-anthropic-${requestId}.txt`);
+            const logContent = `[${new Date().toISOString()}] Request model=${model} stream=false\nSystem: ${JSON.stringify(systemInstruction, null, 2)}\nTools: ${JSON.stringify(tools, null, 2)}\nContents:\n${JSON.stringify(contents, null, 2)}\n\n`;
+            await fs.appendFile(logPath, logContent);
+          } catch (e) {
+            // Ignore logging errors
+          }
+        }
+
+        const response = await config.getContentGenerator().generateContent(
+          {
+              model,
+              contents: contents as any,
+              config: {
+                temperature,
+                topP,
+                maxOutputTokens,
+                ...(tools && { tools: tools as any }),
+                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
+              }
+          },
+          requestId
         );
 
-        // This part needs to be completely rewritten to adapt the new response format
-        const usage = (response as any).usageMetadata;
+        const usage = (response as any).usageMetadata || (response as any).usage_metadata;
         const content: any[] = [];
-        const text = response.candidates?.[0]?.content?.parts?.map((p: any) => 'text' in p ? p.text : '').join('') || '';
-        if (text) {
+
+        // Filter thought parts first
+        const parts = filterThoughtParts(response.candidates?.[0]?.content?.parts || []);
+
+        // Extract text
+        const textParts = parts.filter((p: any) => p.text && !p.functionCall);
+        if (textParts.length > 0) {
+          const text = textParts.map((p: any) => p.text).join('');
           content.push({ type: 'text', text });
         }
+
+        // Check for tool calls
+        for (const part of parts) {
+          if ((part as any).functionCall) {
+            const fc = (part as any).functionCall;
+            content.push({
+              type: 'tool_use',
+              id: `toolu_${uuidv4()}`,
+              name: fc.name,
+              input: fc.args || {}
+            });
+          }
+        }
+
+        const prompt = usage?.promptTokenCount ?? usage?.prompt_token_count ?? 0;
+        const candidates = usage?.candidatesTokenCount ?? usage?.candidates_token_count ?? 0;
+        const thinking = usage?.thoughtsTokenCount ?? usage?.thoughts_token_count ?? usage?.thinking_token_count ?? 0;
 
         const result = {
           id: `msg_${uuidv4()}`,
@@ -526,23 +611,43 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           stop_reason: 'end_turn',
           stop_sequence: null,
           usage: {
-            input_tokens: usage?.promptTokenCount || 0,
-            output_tokens: usage?.candidatesTokenCount || 0,
+            input_tokens: prompt,
+            output_tokens: candidates,
           },
         };
 
-        const totalTokens = sumTokenCounts(usage?.promptTokenCount, usage?.candidatesTokenCount);
+        const totalTokens = sumTokenCounts(prompt, candidates, thinking);
+        const promptStr = `prompt=${formatTokenCount(prompt)}`;
+        const thinkingStr = thinking ? ` thinking=${formatTokenCount(thinking)}` : '';
+        const outputStr = `output=${formatTokenCount(candidates)}`;
+        const totalStr = `total=${formatTokenCount(totalTokens)}`;
+        
         logger.info(
-          `[CLAUDE_PROXY][${requestId}] model=${model} usage: prompt=${formatTokenCount(usage?.promptTokenCount)} completion=${formatTokenCount(usage?.candidatesTokenCount)} total=${formatTokenCount(totalTokens)} tokens`,
+          `[CLAUDE_PROXY][${requestId}] model=${model} usage: ${promptStr}${thinkingStr} ${outputStr} ${totalStr} tokens`,
         );
 
-        return res.status(200).json(result);
+        await writeDebugLog(requestId, 'non-stream', {
+          request: {
+            contents,
+            config: {
+                temperature,
+                topP,
+                maxOutputTokens,
+                tools,
+                systemInstruction,
+              },
+            model,
+          },
+          response: {
+            raw: response,
+            formatted: result,
+          },
+        });
 
+        return res.status(200).json(result);
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : 'Bad request';
-      const stack = e instanceof Error ? e.stack : '';
-      logger.error(`[CLAUDE_PROXY][${requestId}] Request failed: ${message}`, stack);
       return res.status(400).json({
         error: {
           type: 'api_error',

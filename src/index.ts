@@ -26,6 +26,22 @@ async function main() {
 
   // Load the default configuration
   const workspaceDir = process.cwd();
+
+  // Parse command line arguments for --log-dir
+  const args = process.argv.slice(2);
+  const logDirArg = args.find(arg => arg.startsWith('--log-dir='));
+  if (logDirArg) {
+    const logDir = logDirArg.split('=')[1];
+    process.env.CLAUDE_PROXY_LOG_DIR = logDir;
+    try {
+      const fs = await import('node:fs/promises');
+      await fs.mkdir(logDir, { recursive: true });
+      logger.info(`Logging detailed conversation history to: ${logDir}`);
+    } catch (e) {
+      logger.error(`Failed to create log directory ${logDir}:`, e);
+    }
+  }
+
   const settings = loadSettings(workspaceDir);
   const config = await loadConfig(settings, extensionLoader, `claude-proxy-init-${Date.now()}`);
 
