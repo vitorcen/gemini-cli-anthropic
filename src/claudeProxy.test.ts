@@ -4,423 +4,428 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { spawn, type ChildProcess } from 'child_process';
-import path from 'path';
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
+import express from 'express';
+import request from 'supertest';
+import { registerClaudeEndpoints } from './claudeProxy';
 
-// Test helper functions
-const PORT = 41242;
-const BASE_URL = `http://localhost:${PORT}`;
+// --- Mocks ---
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const mockGenerateContentStream = vi.fn();
+const mockGenerateContent = vi.fn();
 
-interface HTTPResponse<T = any> {
-  status: number;
-  data: T;
-  headers: Headers;
-}
+// Mock the Config object structure
+const mockGetContentGenerator = vi.fn(() => ({
+  generateContentStream: mockGenerateContentStream,
+  generateContent: mockGenerateContent,
+}));
 
-async function POST<T = any>(
-  endpoint: string,
-  body: any
-): Promise<HTTPResponse<T>> {
-  const response = await fetch(`${BASE_URL}${endpoint}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
+const mockInitialize = vi.fn();
+const mockSetSystemInstruction = vi.fn();
+const mockSetTools = vi.fn();
+const mockGetChat = vi.fn(() => ({
+  setSystemInstruction: mockSetSystemInstruction,
+  setTools: mockSetTools,
+}));
+
+const mockGetGeminiClient = vi.fn(() => ({
+  initialize: mockInitialize,
+  isInitialized: () => true,
+  getChat: mockGetChat,
+}));
+
+const mockConfig = {
+  getContentGenerator: mockGetContentGenerator,
+  getGeminiClient: mockGetGeminiClient,
+};
+
+// Mock module dependencies
+vi.mock('@google/gemini-cli-core', () => ({
+  DEFAULT_GEMINI_FLASH_MODEL: 'gemini-2.5-flash',
+  DEFAULT_GEMINI_MODEL: 'gemini-2.5-pro',
+  SimpleExtensionLoader: class {},
+  GeminiEventType: {
+    Content: 'content',
+    ToolCallRequest: 'tool_call_request',
+    Finished: 'finished',
+    Error: 'error'
+  }
+}));
+
+vi.mock('@a2a/config/config.js', () => ({
+  loadConfig: vi.fn().mockResolvedValue(mockConfig),
+}));
+
+vi.mock('@a2a/config/settings.js', () => ({
+  loadSettings: vi.fn().mockReturnValue({}),
+}));
+
+// Mock logger to reduce noise during tests
+vi.mock('./utils/logger', () => ({
+  logger: {
+    info: vi.fn(),
+    debug: vi.fn(),
+    error: vi.fn(),
+    warn: vi.fn(),
+  },
+}));
+
+// --- Test Suite ---
+
+describe('Claude Proxy (gemini-cli-anthropic)', () => {
+  let app: express.Express;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    app = express();
+    app.use(express.json({ limit: '50mb' })); // Match index.ts
+    const router = express.Router();
+    registerClaudeEndpoints(router, mockConfig as any);
+    app.use('/v1', router);
   });
 
-  const data = await response.json();
-
-  return {
-    status: response.status,
-    data,
-    headers: response.headers,
-  };
-}
-
-interface SSEEvent {
-  type?: string;
-  data: any;
-  raw: string;
-}
-
-async function streamPOST(
-  endpoint: string,
-  body: any,
-  headers: Record<string, string> = {}
-): Promise<SSEEvent[]> {
-  const response = await fetch(`${BASE_URL}${endpoint}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...headers,
-    },
-    body: JSON.stringify({ ...body, stream: true }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    console.error(`❌ Stream request failed: ${response.status} ${text}`);
-    throw new Error(`Stream request failed: ${response.status} ${text}`);
-  }
-
-  const events: SSEEvent[] = [];
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-
-  let buffer = '';
-  let currentEvent: Partial<SSEEvent> = {};
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        if (currentEvent.data !== undefined) {
-          events.push(currentEvent as SSEEvent);
-          currentEvent = {};
-        }
-        continue;
-      }
-
-      if (trimmed.startsWith('event: ')) {
-        currentEvent.type = trimmed.slice(7);
-      } else if (trimmed.startsWith('data: ')) {
-        const dataStr = trimmed.slice(6);
-        currentEvent.raw = dataStr;
-
-        if (dataStr === '[DONE]') {
-          continue;
-        }
-
-        try {
-          currentEvent.data = JSON.parse(dataStr);
-        } catch {
-          currentEvent.data = dataStr;
-        }
-      }
-    }
-  }
-
-  if (currentEvent.data !== undefined) {
-    events.push(currentEvent as SSEEvent);
-  }
-
-  return events;
-}
-
-// Server management
-let serverProcess: ChildProcess | null = null;
-
-async function startServer() {
-  // Check if using existing server
-  if (process.env['USE_EXISTING_SERVER'] === '1') {
-    console.log('🔗 Using existing server on', BASE_URL);
-    try {
-      const healthResponse = await fetch(BASE_URL); // Root check might 404, but connection works
-      // We don't have a health endpoint, so we assume if we connect it's up.
-      console.log('✅ Connected to existing server');
-      return;
-    } catch (error) {
-      throw new Error(`USE_EXISTING_SERVER=1 but no server found on ${BASE_URL}`);
-    }
-  }
-
-  console.log('🚀 Starting server for Claude tests...');
-
-  const env: Record<string, string> = {
-    ...process.env as Record<string, string>,
-    PORT: PORT.toString(), // Changed from CODER_AGENT_PORT
-    USE_CCPA: '1',
-    // We need to point to a valid gemini-cli setup? 
-    // The current dir has gemini-cli submodule.
-  };
-  delete env['NODE_ENV'];
-
-  // npm start runs "dotenv tsx src/index.ts"
-  serverProcess = spawn('npm', ['start'], {
-    cwd: process.cwd(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: false,
-    shell: true,
-    env
-  });
-
-  serverProcess.stdout?.on('data', (data) => {
-    const message = data.toString();
-    if (process.env['VERBOSE']) console.log('[Server]', message.trim());
-  });
-
-  serverProcess.stderr?.on('data', (data) => {
-    const message = data.toString();
-    console.error('[Server Error]', message.trim());
-  });
-
-  // Wait for server to start
-  // We'll poll the port
-  const startTime = Date.now();
-  while (Date.now() - startTime < 30000) {
-    try {
-        // Try a simple fetch to the port. 404 is fine (server is up).
-        // The server only mounts /v1/messages, so / might 404.
-        await fetch(`${BASE_URL}/v1/messages`, { method: 'OPTIONS' }); // Or just connect
-        console.log('✅ Server started on', BASE_URL);
-        return;
-    } catch (e) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-  }
-  throw new Error('Server failed to start in 30s');
-}
-
-async function stopServer() {
-  if (process.env['USE_EXISTING_SERVER'] === '1') {
-    console.log('🔗 Leaving existing server running');
-    return;
-  }
-
-  if (serverProcess) {
-    console.log('🛑 Stopping server...');
-    // Kill the whole process group
-    if (serverProcess.pid) {
-      try {
-        process.kill(-serverProcess.pid, 'SIGKILL');
-      } catch (e) {
-        // If negative PID fails (maybe not in a new group?), try normal kill
-        serverProcess.kill('SIGKILL');
-      }
-    }
-    // Give it a moment
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    serverProcess = null;
-  }
-}
-
-describe('Claude Proxy API', () => {
-  beforeAll(async () => {
-    await startServer();
-  }, 60000);
-
-  afterAll(async () => {
-    await stopServer();
-  });
-
-  beforeEach(async () => {
-    console.log('⏳ Waiting 5s to respect rate limits...');
-    await delay(5000);
-  });
-
-  test('should handle a non-streaming chat message', async () => {
-    console.log('\n📝 Testing non-streaming message...');
-
-    const response = await POST('/v1/messages', {
-      model: 'gemini-2.5-flash',
-      messages: [{ role: 'user', content: 'Hello' }],
-      max_tokens: 20000,
+  // 1. Basic Chat (Non-Streaming)
+  // Replaces: "should handle a non-streaming chat message"
+  test('Chat (Non-Streaming): should return correct response format', async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: 'Hello world' }] } }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 }
     });
 
-    if (response.status !== 200) {
-        console.error('Error response:', response.data);
-    }
-
-    // Print token usage
-    if (response.data.usage) {
-      const usage = response.data.usage;
-      console.log(`📊 Tokens - Input: ${usage.input_tokens}, Output: ${usage.output_tokens}`);
-    }
+    const response = await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Hi' }],
+        max_tokens: 100
+      });
 
     expect(response.status).toBe(200);
-    expect(response.data.content).toBeDefined();
-    expect(response.data.content[0]?.text).toBeDefined();
-    expect(response.data.role).toBe('assistant');
-    expect(response.data.model).toBeDefined();
-    // Relax token check if 0
-    // expect(response.data.usage.input_tokens).toBeGreaterThan(0);
-    // expect(response.data.usage.output_tokens).toBeGreaterThan(0);
-
-    console.log('✅ Response:', response.data.content[0]?.text);
-  }, 60000);
-
-  test('should handle a streaming chat message', async () => {
-    console.log('\n📝 Testing streaming message...');
-
-    const events = await streamPOST('/v1/messages', {
+    expect(response.body).toEqual({
+      id: expect.stringMatching(/^msg_/),
+      type: 'message',
+      role: 'assistant',
       model: 'gemini-2.5-flash',
-      messages: [{ role: 'user', content: 'Say hello in one word' }],
-      max_tokens: 20000,
+      content: [{ type: 'text', text: 'Hello world' }],
+      stop_reason: 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 10, output_tokens: 5 }
     });
 
-    const messageStart = events.find((e) => e.type === 'message_start');
-    expect(messageStart).toBeDefined();
-
-    const messageStop = events.find((e) => e.type === 'message_stop');
-    expect(messageStop).toBeDefined();
-
-    const contentStarts = events.filter((e) => e.type === 'content_block_start');
-    const contentDeltas = events.filter((e) => e.type === 'content_block_delta');
-    // content_block_stop might be optional depending on implementation, but claudeProxy.ts emits it.
-    const contentStops = events.filter((e) => e.type === 'content_block_stop');
-
-    expect(contentStarts.length).toBeGreaterThanOrEqual(1);
-    expect(contentDeltas.length).toBeGreaterThanOrEqual(1);
-    
-    // Check accumulated text
-    const accumulatedText = contentDeltas.reduce((acc, e) => acc + (e.data?.delta?.text || ''), '');
-    console.log('✅ Streamed text:', accumulatedText);
-    expect(accumulatedText.length).toBeGreaterThan(0);
-  }, 60000);
-
-  test('should handle multi-turn conversation with history (non-streaming)', async () => {
-    console.log('\n📝 Testing multi-turn conversation (non-streaming)...');
-
-    // Round 1: Ask name
-    const response1 = await POST('/v1/messages', {
-      model: 'gemini-2.5-flash',
-      messages: [
-        { role: 'user', content: 'My name is Alice. Please confirm you understand.' }
-      ],
-      max_tokens: 20000,
-    });
-
-    expect(response1.status).toBe(200);
-    if (!response1.data.content || response1.data.content.length === 0) {
-         console.warn('Round 1 returned no content. Retrying...');
-         // Retry logic or just fail with message
-         throw new Error('Round 1 returned no content');
-    }
-    const baselineInputTokens = response1.data.usage?.input_tokens || 0;
-
-    // Round 2: Test memory (with history)
-    const response2 = await POST('/v1/messages', {
-      model: 'gemini-2.5-flash',
-      messages: [
-        { role: 'user', content: 'My name is Alice. Remember it.' },
-        { role: 'assistant', content: response1.data.content[0].text },
-        { role: 'user', content: 'What is my name? Answer with just the name.' }
-      ],
-      max_tokens: 20000,
-    });
-
-    expect(response2.status).toBe(200);
-    const responseText = response2.data.content[0]?.text?.toLowerCase();
-    console.log('Response 2:', responseText);
-    expect(responseText).toMatch(/alice/i);
-  }, 60000);
-
-  test('should handle multi-turn conversation with history (streaming)', async () => {
-    console.log('\n📝 Testing multi-turn conversation (streaming)...');
-
-    // Round 1
-    const events1 = await streamPOST('/v1/messages', {
-      model: 'gemini-2.5-flash',
-      messages: [
-        { role: 'user', content: 'Hi, I am Bob.' }
-      ],
-      max_tokens: 20000,
-    });
-
-    const text1 = events1
-      .filter((e) => e.type === 'content_block_delta' && e.data?.delta?.type === 'text_delta')
-      .reduce((acc, e) => acc + (e.data.delta.text || ''), '');
-
-    // Round 2
-    const events2 = await streamPOST('/v1/messages', {
-      model: 'gemini-2.5-flash',
-      messages: [
-        { role: 'user', content: 'Hi, I am Bob.' },
-        { role: 'assistant', content: text1 },
-        { role: 'user', content: 'What is my name? Just say the name.' }
-      ],
-      max_tokens: 20000,
-    });
-
-    const text2 = events2
-      .filter((e) => e.type === 'content_block_delta' && e.data?.delta?.type === 'text_delta')
-      .reduce((acc, e) => acc + (e.data.delta.text || ''), '');
-
-    console.log('Round 2 response:', text2);
-    if (text2) {
-        expect(text2.toLowerCase()).toMatch(/bob/i);
-    } else {
-        // Could be tool call
-        console.warn('No text in round 2, checking for tool calls not implemented in this simplified test.');
-    }
-  }, 60000);
-
-  // ... I'll skip tool tests for the first pass to see if basic chat works, 
-  // but the prompt asked to "port over", so I should probably include them. 
-  // However, `claudeProxy.test.ts` tool tests rely on the model deciding to use tools.
-  // If I'm using `gemini-flash-latest`, it should work.
-
-  test('should handle a streaming message with a tool call', async () => {
-      console.log('\n📝 Testing streaming tool call...');
-  
-      const events = await streamPOST('/v1/messages', {
+    // Verify underlying call
+    expect(mockGenerateContent).toHaveBeenCalledWith(
+      expect.objectContaining({
         model: 'gemini-2.5-flash',
-        messages: [{ role: 'user', content: 'What is the weather in Tokyo? Use the get_weather function.' }],
-        tools: [{
-          name: 'get_weather',
-          description: 'Get weather for a city',
-          input_schema: {
-            type: 'object',
-            properties: {
-              location: { type: 'string', description: 'City name' }
-            },
-            required: ['location']
-          }
-        }],
-        max_tokens: 20000,
-      });
-  
-      const toolUseStart = events.find(
-        (e) => e.type === 'content_block_start' && e.data?.content_block?.type === 'tool_use'
-      );
-  
-      if (toolUseStart) {
-        console.log('✅ Tool call detected:', toolUseStart.data.content_block.name);
-        expect(toolUseStart.data.content_block.name).toBe('get_weather');
-      } else {
-        console.log('⚠️  Model responded with text instead of tool call - this can happen with LLMs');
-      }
-    }, 60000);
+        contents: [{ role: 'user', parts: [{ text: 'Hi' }] }]
+      }),
+      expect.any(String) // requestId
+    );
+  });
 
-    test('should support X-Working-Directory header', async () => {
-        console.log('\n📝 Testing X-Working-Directory header...'); 
+  // 2. Basic Chat (Streaming)
+  // Replaces: "should handle a streaming chat message"
+  test('Chat (Streaming): should emit SSE events correctly', async () => {
+    async function* mockStream() {
+      yield {
+        candidates: [{ content: { parts: [{ text: 'Hello' }] } }],
+        usageMetadata: { promptTokenCount: 5 }
+      };
+      yield {
+        candidates: [{ content: { parts: [{ text: ' World' }] } }],
+        usageMetadata: { candidatesTokenCount: 2 }
+      };
+    }
+    mockGenerateContentStream.mockResolvedValue(mockStream());
+
+    const response = await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Hi' }],
+        stream: true
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toBe('text/event-stream');
+
+    const text = response.text;
     
-        // Use current working directory to avoid warnings
-        const workingDir = process.cwd();
+    // Verify Event Sequence
+    expect(text).toContain('event: message_start');
+    expect(text).toContain('"type":"message_start"');
     
-        const response = await fetch(`${BASE_URL}/v1/messages`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Working-Directory': workingDir,
+    expect(text).toContain('event: content_block_start');
+    expect(text).toContain('"type":"content_block_start"');
+    
+    expect(text).toContain('event: content_block_delta');
+    expect(text).toContain('"text":"Hello"');
+    expect(text).toContain('"text":" World"');
+    
+    expect(text).toContain('event: message_delta');
+    expect(text).toContain('"stop_reason":"end_turn"');
+    
+    expect(text).toContain('event: message_stop');
+  });
+
+  // 3. History Sanitization (Critical Fix)
+  // Covers: "Sanitization: should convert historical tool_use to [SYSTEM LOG] text"
+  test('History Sanitization: should emit functionCall/functionResponse for tool history', async () => {
+    mockGenerateContent.mockResolvedValue({
+      candidates: [{ content: { parts: [{ text: 'Acknowledged' }] } }]
+    });
+
+    // Simulate history: User -> Assistant (Tool Use) -> User (Tool Result)
+    await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [
+          { role: 'user', content: 'List files' },
+          {
+            role: 'assistant', 
+            content: [
+              { type: 'text', text: 'I will list files.' },
+              { type: 'tool_use', id: 'call_1', name: 'ls', input: { path: '.' } }
+            ] 
           },
-          body: JSON.stringify({
-            model: 'gemini-2.5-flash',
-            messages: [{ role: 'user', content: 'Test with custom working directory. Reply with "Verified".' }],
-            max_tokens: 20000,
-          }),
-        });
+          {
+            role: 'user', 
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_1', content: 'file1.txt\nfile2.txt' }
+            ] 
+          }
+        ]
+      });
+
+    const callArgs = mockGenerateContent.mock.calls[0][0];
+    const contents = callArgs.contents;
+
+    expect(contents).toHaveLength(3);
+
+    // 1. User normal message
+    expect(contents[0].parts[0].text).toBe('List files');
+
+    // 2. Assistant message (Sanitized)
+    expect(contents[1].role).toBe('model');
+    // Should keep text part
+    expect(contents[1].parts[0].text).toBe('I will list files.');
+    const toolUsePart = contents[1].parts[1].functionCall;
+    expect(toolUsePart).toEqual({
+      name: 'ls',
+      args: { path: '.' }
+    });
+
+    // 3. User message (Sanitized Result)
+    expect(contents[2].role).toBe('user');
+    const toolResultPart = contents[2].parts[0].functionResponse;
+    expect(toolResultPart).toEqual({
+      name: 'ls',
+      response: { result: 'file1.txt\nfile2.txt' }
+    });
+  });
+
+  // 3.1 Sequential Tool Use (Multi-tool Sanitization)
+  test('History Sanitization: should handle sequential tool uses in one turn', async () => {
+    mockGenerateContent.mockResolvedValue({ candidates: [] });
+
+    await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [
+          { role: 'user', content: 'Check files' },
+          { 
+            role: 'assistant', 
+            content: [
+              { type: 'text', text: 'I will run two commands.' },
+              { type: 'tool_use', id: 'call_1', name: 'ls', input: { path: '.' } },
+              { type: 'tool_use', id: 'call_2', name: 'grep', input: { pattern: 'foo' } }
+            ] 
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_1', content: 'file1' },
+              { type: 'tool_result', tool_use_id: 'call_2', content: 'match' }
+            ]
+          }
+        ]
+      });
+
+    const callArgs = mockGenerateContent.mock.calls[0][0];
+    const contents = callArgs.contents;
     
-        const data = await response.json();
-        expect(response.status).toBe(200);
-        if (data.content && data.content.length > 0) {
-             expect(data.content[0].text).toBeDefined();
-             console.log(`✅ Working directory header accepted: ${workingDir}`);
-        } else {
-            // If empty, it's likely a model issue, but technically a failure for the test expectation
-             console.warn('⚠️ Received empty content for X-Working-Directory test');
-        }
-       
-    }, 60000);
+    // Assistant message should have 3 parts: Text, ToolCall 1, ToolCall 2
+    const assistantMsg = contents[1];
+    expect(assistantMsg.parts).toHaveLength(3);
+    expect(assistantMsg.parts[0].text).toBe('I will run two commands.');
+    expect(assistantMsg.parts[1].functionCall).toEqual({
+      name: 'ls',
+      args: { path: '.' }
+    });
+    expect(assistantMsg.parts[2].functionCall).toEqual({
+      name: 'grep',
+      args: { pattern: 'foo' }
+    });
+
+    // User message should have 2 parts: Result 1, Result 2
+    const userMsg = contents[2];
+    expect(userMsg.parts).toHaveLength(2);
+    expect(userMsg.parts[0].functionResponse).toEqual({
+      name: 'ls',
+      response: { result: 'file1' }
+    });
+    expect(userMsg.parts[1].functionResponse).toEqual({
+      name: 'grep',
+      response: { result: 'match' }
+    });
+  });
+
+  test('History Sanitization: should handle tool_id-only references', async () => {
+    mockGenerateContent.mockResolvedValue({ candidates: [] });
+
+    await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [
+          { role: 'user', content: 'Check files again' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'text', text: 'I will run read command.' },
+              { type: 'tool_use', tool_id: 'read_123', name: 'Read', input: { path: '.' } }
+            ]
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', tool_id: 'read_123', content: 'contents' }
+            ]
+          }
+        ]
+      });
+
+    const callArgs = mockGenerateContent.mock.calls[0][0];
+    const sanitizedAssistant = callArgs.contents[1];
+    expect(sanitizedAssistant.parts[1].functionCall).toEqual({
+      name: 'Read',
+      args: { path: '.' }
+    });
+
+    const sanitizedUser = callArgs.contents[2];
+    expect(sanitizedUser.parts[0].functionResponse).toEqual({
+      name: 'Read',
+      response: { result: 'contents' }
+    });
+  });
+
+  // 4. Tool Use Generation (Model Output)
+  // Replaces: "should handle a streaming message with a tool call"
+  test('Tool Generation: should handle model generating a tool call (Streaming)', async () => {
+    async function* mockToolStream() {
+      yield {
+        candidates: [{ 
+          content: { 
+            parts: [{ 
+              functionCall: { name: 'get_weather', args: { city: 'Tokyo' } } 
+            }] 
+          } 
+        }],
+        usageMetadata: { promptTokenCount: 10 }
+      };
+    }
+    mockGenerateContentStream.mockResolvedValue(mockToolStream());
+
+    const response = await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Weather in Tokyo?' }],
+        tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+        stream: true
+      });
+
+    const text = response.text;
+    
+    // Verify Tool Call Events
+    expect(text).toContain('event: content_block_start');
+    expect(text).toContain('"type":"tool_use"');
+    expect(text).toContain('"name":"get_weather"');
+    
+    expect(text).toContain('event: content_block_delta');
+    expect(text).toContain('"type":"input_json_delta"');
+    expect(text).toContain('Tokyo');
+  });
+
+  test('Tool Generation: should emit {} args when functionCall has no args', async () => {
+    async function* mockToolStream() {
+      yield {
+        candidates: [{ content: { parts: [{ functionCall: { name: 'noop' } }] } }],
+      };
+    }
+    mockGenerateContentStream.mockResolvedValue(mockToolStream());
+
+    const response = await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Call noop' }],
+        tools: [{ name: 'noop', input_schema: { type: 'object' } }],
+        stream: true
+      });
+
+    expect(response.text).toContain('"partial_json":"{}"');
+  });
+
+  // 5. Retry Logic (Quota Exhausted)
+  // Covers: "Retry Logic: should retry on quota exhausted error"
+  test('Retry Logic: should wait and retry on quota exhausted error', async () => {
+    // First call fails
+    mockGenerateContent.mockRejectedValueOnce(new Error('API Error: 400 ... You have exhausted your capacity ... reset after 0s.'));
+    // Second call succeeds
+    mockGenerateContent.mockResolvedValueOnce({
+      candidates: [{ content: { parts: [{ text: 'Success after retry' }] } }]
+    });
+
+    const start = Date.now();
+    const response = await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Retry me' }]
+      });
+    const duration = Date.now() - start;
+
+    expect(response.status).toBe(200);
+    expect(response.body.content[0].text).toBe('Success after retry');
+    expect(mockGenerateContent).toHaveBeenCalledTimes(2);
+    
+    // Should have waited at least 1000ms (reset 0s + 1s buffer)
+    expect(duration).toBeGreaterThanOrEqual(1000);
+  });
+
+  // 6. System Instruction Injection (Verification of REMOVAL)
+  // Covers: "System Instruction: should NOT inject reminder"
+  test('System Instruction: should NOT inject artificial reminders', async () => {
+    mockGenerateContent.mockResolvedValue({ candidates: [] });
+
+    await request(app)
+      .post('/v1/messages')
+      .send({
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Hi' }],
+        tools: [{ name: 'test', input_schema: {} }],
+        system: 'User defined system prompt'
+      });
+
+    const callArgs = mockGenerateContent.mock.calls[0][0];
+    const sys = callArgs.config.systemInstruction;
+    
+    // Should be exactly what user sent, no "IMPORTANT" appended
+    expect(sys.parts[0].text).toBe('User defined system prompt');
+    expect(sys.parts[0].text).not.toContain('IMPORTANT');
+    expect(sys.parts[0].text).not.toContain('[SYSTEM LOG]');
+  });
+
 });

@@ -8,6 +8,50 @@ import type express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import type { Config } from '@google/gemini-cli-core';
 import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, DEFAULT_GEMINI_MODEL } from '@google/gemini-cli-core';
+const MAX_RETRIES = 5;
+const BASE_RETRY_DELAY_MS = 1000;
+
+async function executeWithRetry<T>(
+  operation: () => Promise<T>, 
+  requestId: string, 
+  model: string
+): Promise<T> {
+  let lastError: any;
+  
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await operation();
+    } catch (e: any) {
+      lastError = e;
+      const message = e.message || '';
+      const isQuotaError = message.includes('exhausted your capacity') || 
+                           message.includes('quota') ||
+                           message.includes('429') ||
+                           (message.includes('400') && message.includes('capacity'));
+
+      if (!isQuotaError) {
+        throw e;
+      }
+
+      if (attempt === MAX_RETRIES) {
+        logger.error(`[CLAUDE_PROXY][${requestId}] Max retries (${MAX_RETRIES}) exceeded for quota error.`);
+        throw e;
+      }
+
+      // Parse wait time from "reset after Xs"
+      let waitMs = BASE_RETRY_DELAY_MS * Math.pow(2, attempt - 1); // Default exponential backoff
+      const match = message.match(/reset after (\d+)s/);
+      if (match && match[1]) {
+        waitMs = (parseInt(match[1], 10) + 1) * 1000; // Add 1s buffer
+      }
+
+      logger.warn(`[CLAUDE_PROXY][${requestId}] Quota exhausted for ${model}. Waiting ${waitMs}ms before retry ${attempt}/${MAX_RETRIES}...`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+    }
+  }
+  throw lastError;
+}
+
 import type { Content } from '@google/generative-ai';
 import { logger } from './utils/logger';
 import fs from 'node:fs/promises';
@@ -34,7 +78,32 @@ interface ClaudeContentBlock {
   name?: string;
   input?: Record<string, any>;
   tool_use_id?: string;
-  content?: string;
+  tool_id?: string;
+  content?: string | Record<string, any>;
+}
+
+function safeStringify(value: unknown): string {
+  if (value === undefined || value === null) {
+    return '';
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function serializeArgsForSse(args: unknown): string {
+  const serialized = safeStringify(args);
+  if (!serialized || serialized === 'undefined') {
+    return '{}';
+  }
+  try {
+    JSON.parse(serialized);
+    return serialized;
+  } catch {
+    return '{}';
+  }
 }
 
 interface ClaudeMessage {
@@ -247,23 +316,31 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           for (const block of message.content) {
             if (block.type === 'text' && block.text) {
               parts.push({ text: block.text });
-            } else if (block.type === 'tool_use' && block.id && block.name) {
+            } else if (block.type === 'tool_use' && (block.id || block.tool_id) && block.name) {
               // Assistant tool call -> Gemini functionCall
-              toolUseMap.set(block.id, block.name);
+              const toolId = block.id || block.tool_id;
+              const args = block.input ?? {};
+              if (toolId) {
+                toolUseMap.set(toolId, block.name);
+              }
               parts.push({
                 functionCall: {
                   name: block.name,
-                  args: block.input || {}
-                }
+                  args,
+                },
               });
-            } else if (block.type === 'tool_result' && block.tool_use_id) {
+            } else if (block.type === 'tool_result') {
               // User tool result -> Gemini functionResponse
-              const toolName = toolUseMap.get(block.tool_use_id) || 'unknown';
+              const toolId = block.tool_use_id || block.tool_id;
+              const toolName = toolId ? (toolUseMap.get(toolId) ?? block.name) : block.name;
+              const resolvedName = toolName || 'unknown';
+              const resultPayload =
+                typeof block.content === 'string' ? { result: block.content } : { result: block.content };
               parts.push({
                 functionResponse: {
-                  name: toolName,
-                  response: { result: block.content || '' }
-                }
+                  name: resolvedName,
+                  response: resultPayload,
+                },
               });
             }
           }
@@ -338,19 +415,23 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             }
           }
           
-          const streamGen = await config.getContentGenerator().generateContentStream(
-            {
-              model,
-              contents: contents as any, // Cast to any to avoid potential type mismatches between SDK versions
-              config: {
-                temperature,
-                topP,
-                maxOutputTokens,
-                ...(tools && { tools: tools as any }),
-                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
-              }
-            },
-            requestId // prompt_id
+          const streamGen = await executeWithRetry(
+            () => config.getContentGenerator().generateContentStream(
+              {
+                model,
+                contents: contents as any, // Cast to any to avoid potential type mismatches between SDK versions
+                config: {
+                  temperature,
+                  topP,
+                  maxOutputTokens,
+                  ...(tools && { tools: tools as any }),
+                  ...(systemInstruction && { systemInstruction: systemInstruction as any }),
+                }
+              },
+              requestId // prompt_id
+            ),
+            requestId,
+            model
           );
 
           let outputTokens = 0;
@@ -462,6 +543,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
                   currentContentIndex++;
                   currentBlockType = 'tool_use';
                   const toolId = `toolu_${uuidv4()}`;
+                  const serializedArgs = serializeArgsForSse(part.functionCall.args ?? {});
                   writeEvent('content_block_start', {
                     type: 'content_block_start',
                     index: currentContentIndex,
@@ -470,7 +552,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
                   writeEvent('content_block_delta', {
                     type: 'content_block_delta',
                     index: currentContentIndex,
-                    delta: { type: 'input_json_delta', partial_json: JSON.stringify(part.functionCall.args) },
+                    delta: { type: 'input_json_delta', partial_json: serializedArgs },
                   });
                   stopCurrentBlock();
                 }
@@ -557,19 +639,23 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           }
         }
 
-        const response = await config.getContentGenerator().generateContent(
-          {
-              model,
-              contents: contents as any,
-              config: {
-                temperature,
-                topP,
-                maxOutputTokens,
-                ...(tools && { tools: tools as any }),
-                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
-              }
-          },
-          requestId
+        const response = await executeWithRetry(
+          () => config.getContentGenerator().generateContent(
+            {
+                model,
+                contents: contents as any,
+                config: {
+                  temperature,
+                  topP,
+                  maxOutputTokens,
+                  ...(tools && { tools: tools as any }),
+                  ...(systemInstruction && { systemInstruction: systemInstruction as any }),
+                }
+            },
+            requestId
+          ),
+          requestId,
+          model
         );
 
         const usage = (response as any).usageMetadata || (response as any).usage_metadata;
