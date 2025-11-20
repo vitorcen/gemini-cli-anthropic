@@ -7,7 +7,7 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { registerClaudeEndpoints } from './claudeProxy';
+import { registerClaudeEndpoints } from './claudeProxy.js';
 
 // --- Mocks ---
 

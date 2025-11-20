@@ -1,9 +1,10 @@
+#!/usr/bin/env node
 import express from 'express';
-import { registerClaudeEndpoints } from './claudeProxy';
-import { logger } from './utils/logger';
-import { loadConfig, loadEnvironment } from '@a2a/config/config.js';
-import { loadSettings } from '@a2a/config/settings.js';
-import { SimpleExtensionLoader } from '@google/gemini-cli-core';
+import { registerClaudeEndpoints } from './claudeProxy.js';
+import { logger } from './utils/logger.js';
+import { loadConfig, loadEnvironment } from '../gemini-cli/packages/a2a-server/src/config/config.js';
+import { loadSettings } from '../gemini-cli/packages/a2a-server/src/config/settings.js';
+import { SimpleExtensionLoader } from '../gemini-cli/packages/core/src/index.js';
 
 async function main() {
   // Set default environment variables if not present

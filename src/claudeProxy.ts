@@ -6,8 +6,8 @@
 
 import type express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import type { Config } from '@google/gemini-cli-core';
-import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, DEFAULT_GEMINI_MODEL } from '@google/gemini-cli-core';
+import type { Config } from '../gemini-cli/packages/core/src/index.js';
+import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, DEFAULT_GEMINI_MODEL } from '../gemini-cli/packages/core/src/index.js';
 const MAX_RETRIES = 5;
 const BASE_RETRY_DELAY_MS = 1000;
 
@@ -53,7 +53,7 @@ async function executeWithRetry<T>(
 }
 
 import type { Content } from '@google/generative-ai';
-import { logger } from './utils/logger';
+import { logger } from './utils/logger.js';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -287,8 +287,8 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
       if (workingDirectory) {
         // Create a new config with the specified working directory
-        const { loadConfig } = await import('@a2a/config/config.js');
-        const { loadSettings } = await import('@a2a/config/settings.js');
+        const { loadConfig } = await import('../gemini-cli/packages/a2a-server/src/config/config.js');
+        const { loadSettings } = await import('../gemini-cli/packages/a2a-server/src/config/settings.js');
         const settings = loadSettings(workingDirectory);
         config = await loadConfig(settings, new SimpleExtensionLoader([]), req.headers['x-request-id'] as string || Date.now().toString());
       }
