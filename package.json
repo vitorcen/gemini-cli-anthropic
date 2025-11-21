@@ -1,6 +1,6 @@
 {
   "name": "@vitorcen/gemini-cli-anthropic",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "Proxy server that enables Claude Code to use Gemini Pro models via gemini-cli",
   "main": "dist/src/index.js",

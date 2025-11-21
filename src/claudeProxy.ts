@@ -10,6 +10,7 @@ import type { Config } from '../gemini-cli/packages/core/src/index.js';
 import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, DEFAULT_GEMINI_MODEL } from '../gemini-cli/packages/core/src/index.js';
 const MAX_RETRIES = 5;
 const BASE_RETRY_DELAY_MS = 1000;
+const SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
 async function executeWithRetry<T>(
   operation: () => Promise<T>, 
@@ -80,6 +81,7 @@ interface ClaudeContentBlock {
   tool_use_id?: string;
   tool_id?: string;
   content?: string | Record<string, any>;
+  thoughtSignature?: string;
 }
 
 function safeStringify(value: unknown): string {
@@ -197,13 +199,8 @@ function mapModelName(requestedModel: string | undefined): string {
  */
 
 function filterThoughtParts(parts: any[]): any[] {
-  return parts
-    .filter(p => !p.thought)  // Filter parts with thought: true
-    .map(p => {
-      // Remove thoughtSignature field from each part
-      const { thoughtSignature, ...rest } = p;
-      return rest;
-    });
+  // Preserve thoughtSignature and other fields; only drop explicit thought blocks to reduce size.
+  return parts.filter(p => !p.thought);
 }
 
 /**
@@ -316,19 +313,26 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           for (const block of message.content) {
             if (block.type === 'text' && block.text) {
               parts.push({ text: block.text });
-            } else if (block.type === 'tool_use' && (block.id || block.tool_id) && block.name) {
+            } else if (block.type === 'tool_use' && (block.id || block.tool_id || true) && block.name) {
               // Assistant tool call -> Gemini functionCall
-              const toolId = block.id || block.tool_id;
+              const toolId = block.id || block.tool_id || `toolu_${uuidv4()}`;
               const args = block.input ?? {};
               if (toolId) {
                 toolUseMap.set(toolId, block.name);
               }
-              parts.push({
+              const thoughtSignature =
+                block.thoughtSignature || SYNTHETIC_THOUGHT_SIGNATURE;
+              const part: any = {
                 functionCall: {
                   name: block.name,
                   args,
                 },
-              });
+              };
+              if (thoughtSignature) {
+                // Gemini expects thoughtSignature on the part (not inside functionCall)
+                part.thoughtSignature = thoughtSignature;
+              }
+              parts.push(part);
             } else if (block.type === 'tool_result') {
               // User tool result -> Gemini functionResponse
               const toolId = block.tool_use_id || block.tool_id;
