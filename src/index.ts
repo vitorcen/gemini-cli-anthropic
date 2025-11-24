@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import express from 'express';
+import { createRequire } from 'node:module';
 import { registerClaudeEndpoints } from './claudeProxy.js';
 import { logger } from './utils/logger.js';
 import { loadConfig, loadEnvironment } from '../gemini-cli/packages/a2a-server/src/config/config.js';
@@ -7,6 +8,17 @@ import { loadSettings } from '../gemini-cli/packages/a2a-server/src/config/setti
 import { SimpleExtensionLoader } from '../gemini-cli/packages/core/src/index.js';
 
 async function main() {
+  // Parse command line arguments first
+  const args = process.argv.slice(2);
+
+  // Handle version flag before any initialization
+  if (args.includes('-v') || args.includes('--version')) {
+    const require = createRequire(import.meta.url);
+    const { version } = require('../../package.json');
+    console.log(version);
+    process.exit(0);
+  }
+
   // Set default environment variables if not present
   if (!process.env.USE_CCPA && !process.env.GEMINI_API_KEY) {
     process.env.USE_CCPA = 'true';
@@ -28,8 +40,7 @@ async function main() {
   // Load the default configuration
   const workspaceDir = process.cwd();
 
-  // Parse command line arguments for --log-dir
-  const args = process.argv.slice(2);
+  // Handle log-dir argument
   const logDirArg = args.find(arg => arg.startsWith('--log-dir='));
   if (logDirArg) {
     const logDir = logDirArg.split('=')[1];

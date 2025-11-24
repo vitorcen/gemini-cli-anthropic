@@ -311,6 +311,78 @@ function collectDebugRequestStats(contents: Content[]) {
   };
 }
 
+function summarizeContentsForDebug(contents: Content[]) {
+  const summaries = contents.map((content, idx) => {
+    const parts = content.parts || [];
+    let totalBytes = 0;
+    let textBytes = 0;
+    let functionCalls = 0;
+    let functionResponses = 0;
+    let maxPartBytes = 0;
+
+    for (const p of parts) {
+      const serialized = JSON.stringify(p) || '';
+      const size = Buffer.byteLength(serialized, 'utf8');
+      totalBytes += size;
+      maxPartBytes = Math.max(maxPartBytes, size);
+      if ((p as any).text !== undefined) {
+        textBytes += Buffer.byteLength(String((p as any).text), 'utf8');
+      }
+      if ((p as any).functionCall) functionCalls++;
+      if ((p as any).functionResponse) functionResponses++;
+    }
+
+    return {
+      index: idx,
+      role: content.role,
+      parts: parts.length,
+      totalBytes,
+      textBytes,
+      maxPartBytes,
+      functionCalls,
+      functionResponses,
+    };
+  });
+
+  const largestParts: Array<{
+    contentIndex: number;
+    partIndex: number;
+    role: string;
+    bytes: number;
+    preview: string;
+  }> = [];
+
+  contents.forEach((content, ci) => {
+    (content.parts || []).forEach((p, pi) => {
+      const serialized = JSON.stringify(p) || '';
+      const size = Buffer.byteLength(serialized, 'utf8');
+      const previewSource =
+        typeof (p as any).text === 'string'
+          ? (p as any).text
+          : serialized;
+      const preview =
+        previewSource.length > 200
+          ? `${previewSource.slice(0, 200)}...`
+          : previewSource;
+
+      largestParts.push({
+        contentIndex: ci,
+        partIndex: pi,
+        role: content.role,
+        bytes: size,
+        preview,
+      });
+    });
+  });
+
+  largestParts.sort((a, b) => b.bytes - a.bytes);
+
+  return {
+    summaries,
+    largestParts: largestParts.slice(0, 10),
+  };
+}
+
 export function registerClaudeEndpoints(app: express.Router, defaultConfig: Config) {
   // Claude-compatible /v1/messages endpoint
   app.post('/messages', async (req: express.Request, res: express.Response) => {
@@ -366,6 +438,11 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           const parts: any[] = [];
 
           for (const block of message.content) {
+            // Drop any explicit thinking/thought blocks so they don't re-enter history
+            if ((block as any).thought !== undefined || (block as any).type === 'thinking') {
+              continue;
+            }
+
             if (block.type === 'text' && block.text) {
               // Skip injected system-reminder payloads that may get duplicated into user turns
               if (message.role === 'user' && block.text.includes('<system-reminder>')) {
@@ -379,18 +456,19 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               if (toolId) {
                 toolUseMap.set(toolId, block.name);
               }
-              const thoughtSignature =
-                block.thoughtSignature || SYNTHETIC_THOUGHT_SIGNATURE;
+              const explicitSignature =
+                (block as any).thoughtSignature ||
+                (block as any).thought_signature;
               const part: any = {
                 functionCall: {
                   name: block.name,
                   args,
                 },
               };
-              if (thoughtSignature) {
-                // Gemini expects thoughtSignature on the part (not inside functionCall)
-                part.thoughtSignature = thoughtSignature;
-              }
+              // Preserve explicit signature, otherwise provide synthetic to satisfy API
+              const signature = explicitSignature || SYNTHETIC_THOUGHT_SIGNATURE;
+              part.thoughtSignature = signature;
+              (part as any).thought_signature = signature;
               parts.push(part);
             } else if (block.type === 'tool_result') {
               // User tool result -> Gemini functionResponse
@@ -483,6 +561,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               model,
               stream: true,
               stats: collectDebugRequestStats(contents),
+              contentDebug: summarizeContentsForDebug(contents),
               systemInstruction,
               tools,
             });
@@ -717,6 +796,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             model,
             stream: false,
             stats: collectDebugRequestStats(contents),
+            contentDebug: summarizeContentsForDebug(contents),
             systemInstruction,
             tools,
           });
