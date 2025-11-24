@@ -1,0 +1,119 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Architecture" id="gemini-cli-anthropic-arch">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Outer Frame -->
+        <mxCell id="frame" value="" style="rounded=0;fillColor=#f8f9fa;strokeColor=#8e9aaf;strokeWidth=2;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="920" height="620" as="geometry" />
+        </mxCell>
+
+        <!-- Title -->
+        <mxCell id="title" value="gemini-cli-anthropic Architecture" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=22;fontStyle=1;fontColor=#1976d2;" vertex="1" parent="1">
+          <mxGeometry x="40" y="50" width="920" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Client Layer (Blue) -->
+        <mxCell id="layer-client" value="" style="rounded=1;fillColor=#e3f2fd;strokeColor=#1976d2;strokeWidth=1.5;" vertex="1" parent="1">
+          <mxGeometry x="60" y="110" width="880" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-client-title" value="Client Layer" style="text;align=left;verticalAlign=middle;fontSize=14;fontStyle=1;fontColor=#1976d2;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="70" y="115" width="150" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="claude-code" value="Claude Code&#xa;(CLI Client)" style="rounded=1;fillColor=#bbdefb;strokeColor=#1976d2;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="400" y="145" width="120" height="45" as="geometry" />
+        </mxCell>
+
+        <!-- Proxy Layer (Orange) -->
+        <mxCell id="layer-proxy" value="" style="rounded=1;fillColor=#fff3e0;strokeColor=#f57c00;strokeWidth=1.5;" vertex="1" parent="1">
+          <mxGeometry x="60" y="220" width="880" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-proxy-title" value="Proxy Layer (Express Server :41242)" style="text;align=left;verticalAlign=middle;fontSize=14;fontStyle=1;fontColor=#f57c00;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="70" y="225" width="300" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="index-ts" value="index.ts&#xa;(Entry Point)" style="rounded=1;fillColor=#ffe0b2;strokeColor=#f57c00;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="200" y="265" width="110" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="claude-proxy" value="claudeProxy.ts&#xa;(API Converter)" style="rounded=1;fillColor=#ffe0b2;strokeColor=#f57c00;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="400" y="265" width="120" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="logger" value="logger.ts&#xa;(Logging)" style="rounded=1;fillColor=#ffe0b2;strokeColor=#f57c00;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="600" y="265" width="100" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="retry-logic" value="executeWithRetry&#xa;(Quota Handling)" style="rounded=1;fillColor=#ffe0b2;strokeColor=#f57c00;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="770" y="265" width="130" height="45" as="geometry" />
+        </mxCell>
+
+        <!-- Conversion Layer (Purple) -->
+        <mxCell id="layer-convert" value="" style="rounded=1;fillColor=#f3e5f5;strokeColor=#7b1fa2;strokeWidth=1.5;" vertex="1" parent="1">
+          <mxGeometry x="60" y="380" width="880" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-convert-title" value="Format Conversion" style="text;align=left;verticalAlign=middle;fontSize=14;fontStyle=1;fontColor=#7b1fa2;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="70" y="385" width="200" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="model-map" value="mapModelName&#xa;sonnet/opus→gemini-pro&#xa;haiku→gemini-flash" style="rounded=1;fillColor=#e1bee7;strokeColor=#7b1fa2;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="150" y="415" width="160" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="msg-convert" value="Message Converter&#xa;Claude→Gemini Format" style="rounded=1;fillColor=#e1bee7;strokeColor=#7b1fa2;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="380" y="415" width="160" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="tool-convert" value="Tool Schema Cleaner&#xa;JSON Schema→Gemini" style="rounded=1;fillColor=#e1bee7;strokeColor=#7b1fa2;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="610" y="415" width="160" height="45" as="geometry" />
+        </mxCell>
+
+        <!-- Gemini Layer (Green) -->
+        <mxCell id="layer-gemini" value="" style="rounded=1;fillColor=#e8f5e8;strokeColor=#388e3c;strokeWidth=1.5;" vertex="1" parent="1">
+          <mxGeometry x="60" y="490" width="880" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="layer-gemini-title" value="Gemini SDK Layer (gemini-cli submodule)" style="text;align=left;verticalAlign=middle;fontSize=14;fontStyle=1;fontColor=#388e3c;spacingLeft=10;" vertex="1" parent="1">
+          <mxGeometry x="70" y="495" width="320" height="25" as="geometry" />
+        </mxCell>
+        <mxCell id="content-gen" value="ContentGenerator&#xa;(Gemini API Client)" style="rounded=1;fillColor=#c8e6c9;strokeColor=#388e3c;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="280" y="530" width="150" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="config" value="Config/Settings&#xa;(Auth, Model Config)" style="rounded=1;fillColor=#c8e6c9;strokeColor=#388e3c;strokeWidth=1.5;fontSize=11;spacingTop=8;spacingBottom=8;" vertex="1" parent="1">
+          <mxGeometry x="500" y="530" width="150" height="45" as="geometry" />
+        </mxCell>
+
+        <!-- External: Gemini API -->
+        <mxCell id="gemini-api" value="Google Gemini API&#xa;(gemini-pro / gemini-flash)" style="rounded=1;fillColor=#fff8e1;strokeColor=#ff8f00;strokeWidth=2;fontSize=11;spacingTop=8;spacingBottom=8;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="350" y="610" width="200" height="45" as="geometry" />
+        </mxCell>
+
+        <!-- Arrows -->
+        <mxCell id="arrow1" value="" style="endArrow=classic;strokeWidth=2;strokeColor=#666666;" edge="1" parent="1" source="claude-code" target="claude-proxy">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="arrow1-label" value="/v1/messages" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;fontColor=#666666;" vertex="1" connectable="0" parent="arrow1">
+          <mxGeometry x="0.2" relative="1" as="geometry">
+            <mxPoint x="-30" y="-10" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="arrow2" value="" style="endArrow=classic;strokeWidth=2;strokeColor=#666666;" edge="1" parent="1" source="index-ts" target="claude-proxy">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="arrow3" value="" style="endArrow=classic;strokeWidth=2;strokeColor=#666666;" edge="1" parent="1" source="claude-proxy" target="msg-convert">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="arrow4" value="" style="endArrow=classic;strokeWidth=2;strokeColor=#666666;" edge="1" parent="1" source="msg-convert" target="content-gen">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="arrow5" value="" style="endArrow=classic;strokeWidth=2;strokeColor=#666666;" edge="1" parent="1" source="content-gen" target="gemini-api">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="arrow5-label" value="generateContent&#xa;generateContentStream" style="edgeLabel;html=1;align=center;verticalAlign=middle;resizable=0;points=[];fontSize=10;fontColor=#666666;" vertex="1" connectable="0" parent="arrow5">
+          <mxGeometry x="0.2" relative="1" as="geometry">
+            <mxPoint x="90" y="10" as="offset" />
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

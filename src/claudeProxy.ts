@@ -204,14 +204,14 @@ function filterThoughtParts(parts: any[]): any[] {
 }
 
 /**
- * Write debug log when DEBUG_LOG_REQUESTS is set
+ * Write debug log when DEBUG_LOG is set
  */
 async function writeDebugLog(
   requestId: string,
   type: string,
   data: Record<string, unknown>,
 ): Promise<void> {
-  if (!process.env['DEBUG_LOG_REQUESTS']) {
+  if (!process.env['DEBUG_LOG']) {
     return;
   }
 
@@ -254,6 +254,61 @@ function mergeConsecutiveContents(contents: Content[]): Content[] {
   }
 
   return merged;
+}
+
+function collectDebugRequestStats(contents: Content[]) {
+  let totalParts = 0;
+  let toolUseCount = 0;
+  let toolResultCount = 0;
+  let lastUserTextLen = 0;
+  let lastAssistantTextLen = 0;
+  let hasSystemReminderInUser = false;
+
+  for (const content of contents) {
+    const parts = content.parts || [];
+    totalParts += parts.length;
+
+    if (content.role === 'user') {
+      for (const p of parts) {
+        if (typeof (p as any).text === 'string') {
+          lastUserTextLen = (p as any).text.length;
+          if ((p as any).text.includes('<system-reminder>')) {
+            hasSystemReminderInUser = true;
+          }
+        }
+      }
+    }
+
+    if (content.role === 'model') {
+      for (const p of parts) {
+        if (typeof (p as any).text === 'string') {
+          lastAssistantTextLen = (p as any).text.length;
+        }
+      }
+    }
+
+    for (const p of parts) {
+      if ((p as any).functionCall) {
+        toolUseCount++;
+      }
+      if ((p as any).functionResponse) {
+        toolResultCount++;
+      }
+    }
+  }
+
+  const totalBytes = Buffer.byteLength(JSON.stringify(contents), 'utf8');
+
+  return {
+    messageCount: contents.length,
+    totalParts,
+    totalBytes,
+    lastUserTextLen,
+    lastAssistantTextLen,
+    hasSystemReminderInUser,
+    toolUseCount,
+    toolResultCount,
+  };
 }
 
 export function registerClaudeEndpoints(app: express.Router, defaultConfig: Config) {
@@ -312,6 +367,10 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           for (const block of message.content) {
             if (block.type === 'text' && block.text) {
+              // Skip injected system-reminder payloads that may get duplicated into user turns
+              if (message.role === 'user' && block.text.includes('<system-reminder>')) {
+                continue;
+              }
               parts.push({ text: block.text });
             } else if (block.type === 'tool_use' && (block.id || block.tool_id || true) && block.name) {
               // Assistant tool call -> Gemini functionCall
@@ -418,6 +477,16 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               // Ignore logging errors
             }
           }
+
+          if (process.env['DEBUG_LOG']) {
+            await writeDebugLog(requestId, 'preflight', {
+              model,
+              stream: true,
+              stats: collectDebugRequestStats(contents),
+              systemInstruction,
+              tools,
+            });
+          }
           
           const streamGen = await executeWithRetry(
             () => config.getContentGenerator().generateContentStream(
@@ -480,7 +549,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           for await (const chunkResp of streamGen) {
             // Collect chunks for debug logging
-            if (process.env['DEBUG_LOG_REQUESTS']) {
+            if (process.env['DEBUG_LOG']) {
               debugChunks.push(chunkResp);
             }
 
@@ -641,6 +710,16 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           } catch (e) {
             // Ignore logging errors
           }
+        }
+
+        if (process.env['DEBUG_LOG']) {
+          await writeDebugLog(requestId, 'preflight', {
+            model,
+            stream: false,
+            stats: collectDebugRequestStats(contents),
+            systemInstruction,
+            tools,
+          });
         }
 
         const response = await executeWithRetry(

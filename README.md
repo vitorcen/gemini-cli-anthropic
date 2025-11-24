@@ -74,7 +74,7 @@ Alternatively, you can use a Gemini API key by setting the `GEMINI_API_KEY` envi
 - `PORT`: Server port (default: 3000)
 - `GEMINI_API_KEY`: Your Google Gemini API key. If provided, this will be used for authentication instead of the default GCP method.
 - `GOOGLE_APPLICATION_CREDENTIALS`: Path to your Google Cloud credentials file (if needed).
-- `DEBUG_LOG_REQUESTS`: Set to `true` to enable detailed request/response logging.
+- `DEBUG_LOG`: Set to `true` to enable detailed request/response logging.
 
 ## Usage with Claude Code
 
@@ -82,8 +82,8 @@ Once the proxy server is running, configure Claude Code to use Gemini models by 
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:3000 \
-ANTHROPIC_MODEL=gemini-2.5-pro \
-ANTHROPIC_DEFAULT_OPUS_MODEL=gemini-2.5-pro \
+ANTHROPIC_MODEL=gemini-3-pro-preview \
+ANTHROPIC_DEFAULT_OPUS_MODEL=gemini-3-pro-preview \
 ANTHROPIC_DEFAULT_SONNET_MODEL=gemini-2.5-flash \
 ANTHROPIC_DEFAULT_HAIKU_MODEL=gemini-2.5-flash \
 claude
