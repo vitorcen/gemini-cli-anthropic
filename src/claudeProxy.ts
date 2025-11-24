@@ -8,6 +8,11 @@ import type express from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import type { Config } from '../gemini-cli/packages/core/src/index.js';
 import { DEFAULT_GEMINI_FLASH_MODEL, SimpleExtensionLoader, DEFAULT_GEMINI_MODEL } from '../gemini-cli/packages/core/src/index.js';
+import { logger } from './utils/logger.js';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 const MAX_RETRIES = 5;
 const BASE_RETRY_DELAY_MS = 1000;
 const SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
@@ -25,10 +30,37 @@ async function executeWithRetry<T>(
     } catch (e: any) {
       lastError = e;
       const message = e.message || '';
-      const isQuotaError = message.includes('exhausted your capacity') || 
+      const isQuotaError = message.includes('exhausted your capacity') ||
                            message.includes('quota') ||
                            message.includes('429') ||
                            (message.includes('400') && message.includes('capacity'));
+
+      if (process.env['DEBUG_LOG_REQUESTS']) {
+        try {
+          const logDir = '/tmp/gemini-cli-anthropic';
+          try { await fs.mkdir(logDir, { recursive: true }); } catch {}
+
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const errorFile = path.join(logDir, `error-${model}-${timestamp}.json`);
+
+          await fs.writeFile(errorFile, JSON.stringify({
+            timestamp: new Date().toISOString(),
+            requestId,
+            model,
+            attempt,
+            error: {
+              name: e.name,
+              message: e.message,
+              stack: e.stack,
+              details: e
+            }
+          }, null, 2));
+
+          logger.error(`Error generating raw content via API with model ${model}. Full report available at: ${errorFile}`);
+        } catch (logError) {
+          // Ignore logging errors
+        }
+      }
 
       if (!isQuotaError) {
         throw e;
@@ -54,10 +86,8 @@ async function executeWithRetry<T>(
 }
 
 import type { Content } from '@google/generative-ai';
-import { logger } from './utils/logger.js';
-import fs from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
+// logger imported at the top
+// fs, os, path imported at the top
 
 const formatTokenCount = (value?: number): string =>
   typeof value === 'number' ? value.toLocaleString('en-US') : '0';
@@ -217,8 +247,18 @@ async function writeDebugLog(
 
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    // Use specific directory for logs
+    const logDir = '/tmp/gemini-cli-anthropic';
+
+    // Ensure directory exists (quietly)
+    try {
+      await fs.mkdir(logDir, { recursive: true });
+    } catch {
+      // Ignore mkdir errors
+    }
+
     const filename = `claude-proxy-${type}-${requestId}-${timestamp}.json`;
-    const filepath = path.join(os.tmpdir(), filename);
+    const filepath = path.join(logDir, filename);
     await fs.writeFile(filepath, JSON.stringify(data, null, 2));
     logger.debug(`[CLAUDE_PROXY][${requestId}] Debug log written to: ${filepath}`);
   } catch (error) {
@@ -539,6 +579,15 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         // @ts-ignore
         res.flushHeaders && res.flushHeaders();
 
+        // Track client aborts (e.g. user presses Esc) to stop forwarding partial responses
+        let aborted = false;
+        const handleAbort = () => {
+          aborted = true;
+        };
+        req.on('aborted', handleAbort);
+        req.on('close', handleAbort);
+        res.on('close', handleAbort);
+
         try {
           // Use ContentGenerator directly to bypass Turn logic
           const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -546,10 +595,18 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB`,
           );
 
-          if (process.env.CLAUDE_PROXY_LOG_DIR) {
+          // Log request details if DEBUG_LOG_REQUESTS is set
+          if (process.env['DEBUG_LOG_REQUESTS']) {
             try {
-              const logPath = path.join(process.env.CLAUDE_PROXY_LOG_DIR, `gemini-cli-anthropic-${requestId}.txt`);
-              const logContent = `[${new Date().toISOString()}] Request model=${model} stream=true\nSystem: ${JSON.stringify(systemInstruction, null, 2)}\nTools: ${JSON.stringify(tools, null, 2)}\nContents:\n${JSON.stringify(contents, null, 2)}\n\n`;
+              const logDir = '/tmp/gemini-cli-anthropic';
+              try { await fs.mkdir(logDir, { recursive: true }); } catch {}
+
+              const logPath = path.join(logDir, `gemini-cli-anthropic-${requestId}.txt`);
+              const logContent = `[INFO] ${new Date().toLocaleString()} -- [CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB\n` +
+                `System: ${JSON.stringify(systemInstruction, null, 2)}\n` +
+                `Tools: ${JSON.stringify(tools, null, 2)}\n` +
+                `Contents:\n${JSON.stringify(contents, null, 2)}\n\n`;
+
               await fs.appendFile(logPath, logContent);
             } catch (e) {
               // Ignore logging errors
@@ -566,7 +623,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               tools,
             });
           }
-          
+
           const streamGen = await executeWithRetry(
             () => config.getContentGenerator().generateContentStream(
               {
@@ -627,6 +684,13 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           const debugChunks: any[] = [];
 
           for await (const chunkResp of streamGen) {
+            if (aborted) {
+              // Stop generating further content once the client disconnects
+              if (typeof streamGen.return === 'function') {
+                try { await streamGen.return(undefined as any); } catch { /* ignore */ }
+              }
+              break;
+            }
             // Collect chunks for debug logging
             if (process.env['DEBUG_LOG']) {
               debugChunks.push(chunkResp);
@@ -714,15 +778,48 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           stopCurrentBlock();
 
+          // If client aborted, skip sending completion events; just exit quietly
+          if (aborted) {
+            logger.info(`[CLAUDE_PROXY][${requestId}] Stream aborted by client; skipping message_stop`);
+            await writeDebugLog(requestId, 'stream', {
+              request: {
+                contents,
+                config: {
+                  temperature,
+                  topP,
+                  maxOutputTokens,
+                  tools,
+                  systemInstruction,
+                },
+                model,
+              },
+              response: {
+                chunks: debugChunks,
+                accumulatedText,
+                usage: {
+                  inputTokens,
+                  outputTokens,
+                  thinkingTokens,
+                  totalTokens: sumTokenCounts(inputTokens, outputTokens, thinkingTokens),
+                },
+                aborted: true,
+              },
+            });
+            return res.end();
+          }
+
           writeEvent('message_delta', {
             type: 'message_delta',
             delta: { stop_reason: 'end_turn', stop_sequence: null },
-            usage: { output_tokens: outputTokens },
+            usage: {
+              output_tokens: outputTokens,
+              thinking_tokens: thinkingTokens
+            },
           });
 
           const totalTokens = sumTokenCounts(inputTokens, outputTokens, thinkingTokens);
           const promptStr = `prompt=${formatTokenCount(inputTokens)}`;
-          const thinkingStr = thinkingTokens ? ` thinking=${formatTokenCount(thinkingTokens)}` : '';
+          const thinkingStr = ` thinking=${formatTokenCount(thinkingTokens)}`;
           const outputStr = `output=${formatTokenCount(outputTokens)}`;
           const totalStr = `total=${formatTokenCount(totalTokens)}`;
           
@@ -773,6 +870,10 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             },
           })}\n\n`);
           return res.end();
+        } finally {
+          req.off('aborted', handleAbort);
+          req.off('close', handleAbort);
+          res.off('close', handleAbort);
         }
       } else {
         // Non-streaming response
@@ -781,10 +882,17 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB`,
         );
 
-        if (process.env.CLAUDE_PROXY_LOG_DIR) {
+        // Log request details if DEBUG_LOG_REQUESTS is set
+        if (process.env['DEBUG_LOG_REQUESTS']) {
           try {
-            const logPath = path.join(process.env.CLAUDE_PROXY_LOG_DIR, `gemini-cli-anthropic-${requestId}.txt`);
-            const logContent = `[${new Date().toISOString()}] Request model=${model} stream=false\nSystem: ${JSON.stringify(systemInstruction, null, 2)}\nTools: ${JSON.stringify(tools, null, 2)}\nContents:\n${JSON.stringify(contents, null, 2)}\n\n`;
+            const logDir = '/tmp/gemini-cli-anthropic';
+            try { await fs.mkdir(logDir, { recursive: true }); } catch {}
+
+            const logPath = path.join(logDir, `gemini-cli-anthropic-${requestId}.txt`);
+            const logContent = `[INFO] ${new Date().toLocaleString()} -- [CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB\n` +
+              `System: ${JSON.stringify(systemInstruction, null, 2)}\n` +
+              `Tools: ${JSON.stringify(tools, null, 2)}\n` +
+              `Contents:\n${JSON.stringify(contents, null, 2)}\n\n`;
             await fs.appendFile(logPath, logContent);
           } catch (e) {
             // Ignore logging errors
@@ -862,12 +970,13 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           usage: {
             input_tokens: prompt,
             output_tokens: candidates,
+            thinking_tokens: thinking,
           },
         };
 
         const totalTokens = sumTokenCounts(prompt, candidates, thinking);
         const promptStr = `prompt=${formatTokenCount(prompt)}`;
-        const thinkingStr = thinking ? ` thinking=${formatTokenCount(thinking)}` : '';
+        const thinkingStr = ` thinking=${formatTokenCount(thinking)}`;
         const outputStr = `output=${formatTokenCount(candidates)}`;
         const totalStr = `total=${formatTokenCount(totalTokens)}`;
         
