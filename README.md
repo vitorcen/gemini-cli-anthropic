@@ -81,7 +81,7 @@ Alternatively, you can use a Gemini API key by setting the `GEMINI_API_KEY` envi
 Once the proxy server is running, configure Claude Code to use Gemini models by setting these environment variables:
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:3000 \
+ANTHROPIC_BASE_URL=http://127.0.0.1:41242 \
 ANTHROPIC_MODEL=gemini-3-pro-preview \
 ANTHROPIC_DEFAULT_OPUS_MODEL=gemini-3-pro-preview \
 ANTHROPIC_DEFAULT_SONNET_MODEL=gemini-2.5-flash \
