@@ -75,6 +75,7 @@ Alternatively, you can use a Gemini API key by setting the `GEMINI_API_KEY` envi
 - `GEMINI_API_KEY`: Your Google Gemini API key. If provided, this will be used for authentication instead of the default GCP method.
 - `GOOGLE_APPLICATION_CREDENTIALS`: Path to your Google Cloud credentials file (if needed).
 - `DEBUG_LOG`: Set to `true` to enable detailed request/response logging.
+- `TEXT_LOG`: Set to `true` to enable logging of text content streaming (default: false).
 
 ## Usage with Claude Code
 

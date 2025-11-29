@@ -68,7 +68,7 @@ async function executeWithRetry<T>(
       }
 
       if (attempt === MAX_RETRIES) {
-        logger.error(`[CLAUDE_PROXY][${requestId}] Max retries (${MAX_RETRIES}) exceeded for quota error.`);
+        logger.error(`[${requestId}] Max retries (${MAX_RETRIES}) exceeded for quota error.`);
         throw e;
       }
 
@@ -79,7 +79,7 @@ async function executeWithRetry<T>(
         waitMs = (parseInt(match[1], 10) + 1) * 1000; // Add 1s buffer
       }
 
-      logger.warn(`[CLAUDE_PROXY][${requestId}] Quota exhausted for ${model}. Waiting ${waitMs}ms before retry ${attempt}/${MAX_RETRIES}...`);
+      logger.warn(`[${requestId}] Quota exhausted for ${model}. Waiting ${waitMs}ms before retry ${attempt}/${MAX_RETRIES}...`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
     }
   }
@@ -243,6 +243,60 @@ function filterThoughtParts(parts: any[]): any[] {
     });
 }
 
+function logThoughtParts(parts: any[], requestId: string, phase: 'stream' | 'non-stream', forceLog = false): void {
+  if (!process.env['TEXT_LOG']) return;
+
+  const thoughtBlocks = forceLog ? parts : parts.filter(p => {
+    const block = p as any;
+    // Use Object.keys for robust check in case of getter/setter issues
+    const hasSignature = Object.keys(block).includes('thoughtSignature') || (block as any).thoughtSignature;
+    return block?.thought || block?.type === 'thinking' || hasSignature;
+  });
+
+  if (thoughtBlocks.length === 0) return;
+
+  const textParts = thoughtBlocks.map(block => {
+    const b = block as any;
+    // Try to extract text from text or content field
+    if (typeof b.text === 'string') return b.text;
+    if (typeof b.content === 'string') return b.content;
+    // Check if thought field itself is a string
+    if (typeof b.thought === 'string') return b.thought;
+
+    // Fallback: stringify the object as JSON, but strip signature to keep log clean
+    try {
+      const cleanBlock = { ...b };
+      delete cleanBlock.thoughtSignature;
+      delete cleanBlock.thought_signature;
+      return JSON.stringify(cleanBlock);
+    } catch {
+      return JSON.stringify(b);
+    }
+  }).filter(Boolean);
+
+  if (textParts.length === 0) {
+    if (forceLog) logger.info(`[${requestId}] TEXT_LOG (Empty thought chunk)`);
+    return;
+  }
+
+  const combinedText = textParts.join(' ');
+
+  if (!combinedText.trim()) {
+    if (forceLog) logger.info(`[${requestId}] TEXT_LOG (Whitespace-only thought chunk)`);
+    return;
+  }
+
+  let displayedText = combinedText;
+  // Collapse whitespace
+  displayedText = displayedText.replace(/\s+/g, ' ').trim();
+
+  if (displayedText.length > 200) {
+    displayedText = `${displayedText.slice(0, 130)}...${displayedText.slice(-70)}`;
+  }
+
+  logger.info(`[${requestId}] TEXT_LOG ${displayedText}`);
+}
+
 /**
  * Write debug log when DEBUG_LOG is set
  */
@@ -270,9 +324,9 @@ async function writeDebugLog(
     const filename = `claude-proxy-${type}-${requestId}-${timestamp}.json`;
     const filepath = path.join(logDir, filename);
     await fs.writeFile(filepath, JSON.stringify(data, null, 2));
-    logger.debug(`[CLAUDE_PROXY][${requestId}] Debug log written to: ${filepath}`);
+    logger.debug(`[${requestId}] Debug log written to: ${filepath}`);
   } catch (error) {
-    logger.error(`[CLAUDE_PROXY][${requestId}] Failed to write debug log:`, error);
+    logger.error(`[${requestId}] Failed to write debug log:`, error);
   }
 }
 
@@ -446,7 +500,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
       // Debug: Log tools if present
       if (body.tools !== undefined) {
-        logger.debug(`[CLAUDE_PROXY][${requestId}] Received tools: ${JSON.stringify(body.tools)}`);
+        logger.debug(`[${requestId}] Received tools: ${JSON.stringify(body.tools)}`);
       }
 
       if (!Array.isArray(body.messages)) {
@@ -591,6 +645,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
         // Track client aborts (e.g. user presses Esc) to stop forwarding partial responses
         let aborted = false;
+        let keepAliveInterval: NodeJS.Timeout | undefined;
         const handleAbort = () => {
           aborted = true;
         };
@@ -602,7 +657,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           // Use ContentGenerator directly to bypass Turn logic
           const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
           logger.info(
-            `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB`,
+            `[${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB`,
           );
 
           // Log request details if DEBUG_LOG_REQUESTS is set
@@ -612,7 +667,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               try { await fs.mkdir(logDir, { recursive: true }); } catch {}
 
               const logPath = path.join(logDir, `gemini-cli-anthropic-${requestId}.txt`);
-              const logContent = `[INFO] ${new Date().toLocaleString()} -- [CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB\n` +
+              const logContent = `[INFO] ${new Date().toLocaleString()} -- [${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB\n` +
                 `System: ${JSON.stringify(systemInstruction, null, 2)}\n` +
                 `Tools: ${JSON.stringify(tools, null, 2)}\n` +
                 `Contents:\n${JSON.stringify(contents, null, 2)}\n\n`;
@@ -689,7 +744,16 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           let accumulatedText = '';
           let messageStartSent = false;
+
+          // Setup keep-alive to prevent timeouts during long thinking phases
+          keepAliveInterval = setInterval(() => {
+            if (!aborted && !res.writableEnded) {
+              res.write(': keep-alive\n\n');
+            }
+          }, 10000); // Send keep-alive every 10s
+
           const debugChunks: any[] = [];
+          let thoughtLogged = false;
 
           for await (const chunkResp of streamGen) {
             if (aborted) {
@@ -736,6 +800,14 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
             // Filter thought parts from chunk
             const rawParts = chunkResp.candidates?.[0]?.content?.parts || [];
+
+            // In stream mode with Gemini Thinking, the first chunk often contains the "thought"
+            // (sometimes disguised as text/system prompt) but no thoughtSignature.
+            // We force log the first non-empty chunk if TEXT_LOG is on.
+            const shouldForceLog = !thoughtLogged && rawParts.length > 0;
+            if (shouldForceLog) thoughtLogged = true;
+
+            logThoughtParts(rawParts, requestId, 'stream', shouldForceLog);
             const filteredParts = filterThoughtParts(rawParts);
 
             // Extract text from this chunk's parts
@@ -788,7 +860,8 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           // If client aborted, skip sending completion events; just exit quietly
           if (aborted) {
-            logger.info(`[CLAUDE_PROXY][${requestId}] Stream aborted by client; skipping message_stop`);
+            // Only log as info if it's actually unexpected, otherwise debug
+            logger.debug(`[${requestId}] Stream aborted by client; skipping message_stop`);
             await writeDebugLog(requestId, 'stream', {
               request: {
                 contents,
@@ -816,6 +889,11 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             return res.end();
           }
 
+          // Remove abort listeners to prevent false positives during cleanup
+          req.off('aborted', handleAbort);
+          req.off('close', handleAbort);
+          res.off('close', handleAbort);
+
           writeEvent('message_delta', {
             type: 'message_delta',
             delta: { stop_reason: 'end_turn', stop_sequence: null },
@@ -832,7 +910,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           const totalStr = `total=${formatTokenCount(totalTokens)}`;
           
           logger.info(
-            `[CLAUDE_PROXY][${requestId}] model=${model} usage: ${promptStr}${thinkingStr} ${outputStr} ${totalStr} tokens`,
+            `[${requestId}] model=${model} usage: ${promptStr}${thinkingStr} ${outputStr} ${totalStr} tokens`,
           );
 
           // Send message_stop event
@@ -879,6 +957,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           })}\n\n`);
           return res.end();
         } finally {
+          clearInterval(keepAliveInterval);
           req.off('aborted', handleAbort);
           req.off('close', handleAbort);
           res.off('close', handleAbort);
@@ -887,7 +966,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         // Non-streaming response
         const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         logger.info(
-          `[CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB`,
+          `[${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB`,
         );
 
         // Log request details if DEBUG_LOG_REQUESTS is set
@@ -897,7 +976,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             try { await fs.mkdir(logDir, { recursive: true }); } catch {}
 
             const logPath = path.join(logDir, `gemini-cli-anthropic-${requestId}.txt`);
-            const logContent = `[INFO] ${new Date().toLocaleString()} -- [CLAUDE_PROXY][${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB\n` +
+            const logContent = `[INFO] ${new Date().toLocaleString()} -- [${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB\n` +
               `System: ${JSON.stringify(systemInstruction, null, 2)}\n` +
               `Tools: ${JSON.stringify(tools, null, 2)}\n` +
               `Contents:\n${JSON.stringify(contents, null, 2)}\n\n`;
@@ -939,7 +1018,9 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         const content: any[] = [];
 
         // Filter thought parts first
-        const parts = filterThoughtParts(response.candidates?.[0]?.content?.parts || []);
+        const rawParts = response.candidates?.[0]?.content?.parts || [];
+        logThoughtParts(rawParts, requestId, 'non-stream');
+        const parts = filterThoughtParts(rawParts);
 
         // Extract text
         const textParts = parts.filter((p: any) => p.text && !p.functionCall);
@@ -987,7 +1068,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         const totalStr = `total=${formatTokenCount(totalTokens)}`;
         
         logger.info(
-          `[CLAUDE_PROXY][${requestId}] model=${model} usage: ${promptStr}${thinkingStr} ${outputStr} ${totalStr} tokens`,
+          `[${requestId}] model=${model} usage: ${promptStr}${thinkingStr} ${outputStr} ${totalStr} tokens`,
         );
 
         await writeDebugLog(requestId, 'non-stream', {
@@ -1012,6 +1093,23 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : 'Bad request';
+
+      if (res.headersSent) {
+        // If headers already sent (e.g. during stream setup), we cannot send JSON error
+        // Try to end the stream with an error event if possible
+        logger.error(`[${requestId}] Error after headers sent: ${message}`);
+        try {
+          if (!res.writableEnded) {
+            res.write(`event: error\n`);
+            res.write(`data: ${JSON.stringify({ error: { type: 'api_error', message } })}\n\n`);
+            res.end();
+          }
+        } catch (ignore) {
+          // If socket is closed, writing might fail
+        }
+        return;
+      }
+
       return res.status(400).json({
         error: {
           type: 'api_error',
