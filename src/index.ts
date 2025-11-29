@@ -6,8 +6,12 @@ import { logger } from './utils/logger.js';
 import { loadConfig, loadEnvironment } from '../gemini-cli/packages/a2a-server/src/config/config.js';
 import { loadSettings } from '../gemini-cli/packages/a2a-server/src/config/settings.js';
 import { SimpleExtensionLoader } from '../gemini-cli/packages/core/src/index.js';
+import { applyClientPatch } from './patches/client-patch.js';
 
 async function main() {
+  // Apply patches first
+  applyClientPatch();
+
   // Parse command line arguments first
   const args = process.argv.slice(2);
 

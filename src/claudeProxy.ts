@@ -13,9 +13,10 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+const SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
+
 const MAX_RETRIES = 5;
 const BASE_RETRY_DELAY_MS = 1000;
-const SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
 async function executeWithRetry<T>(
   operation: () => Promise<T>, 
@@ -229,8 +230,17 @@ function mapModelName(requestedModel: string | undefined): string {
  */
 
 function filterThoughtParts(parts: any[]): any[] {
-  // Preserve thoughtSignature and other fields; only drop explicit thought blocks to reduce size.
-  return parts.filter(p => !p.thought);
+  return parts
+    // Drop explicit thought blocks so they don't leak into the user-visible stream/history
+    .filter(p => !(p as any)?.thought)
+    .map(p => {
+      if (p && typeof p === 'object') {
+        // Strip signatures from responses; requests will re-add synthetic ones as needed
+        const { thoughtSignature, thought_signature, ...rest } = p as any;
+        return rest;
+      }
+      return p;
+    });
 }
 
 /**
@@ -485,13 +495,13 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
             if (block.type === 'text' && block.text) {
               // Skip injected system-reminder payloads that may get duplicated into user turns
-              if (message.role === 'user' && block.text.includes('<system-reminder>')) {
-                continue;
-              }
+              // if (message.role === 'user' && block.text.includes('<system-reminder>')) {
+              //   continue;
+              // }
               parts.push({ text: block.text });
-            } else if (block.type === 'tool_use' && (block.id || block.tool_id || true) && block.name) {
+            } else if (block.type === 'tool_use' && (block.id || (block as any).tool_id || true) && block.name) {
               // Assistant tool call -> Gemini functionCall
-              const toolId = block.id || block.tool_id || `toolu_${uuidv4()}`;
+              const toolId = block.id || (block as any).tool_id || `toolu_${uuidv4()}`;
               const args = block.input ?? {};
               if (toolId) {
                 toolUseMap.set(toolId, block.name);
@@ -512,7 +522,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               parts.push(part);
             } else if (block.type === 'tool_result') {
               // User tool result -> Gemini functionResponse
-              const toolId = block.tool_use_id || block.tool_id;
+              const toolId = block.tool_use_id || (block as any).tool_id;
               const toolName = toolId ? (toolUseMap.get(toolId) ?? block.name) : block.name;
               const resolvedName = toolName || 'unknown';
               const resultPayload =
@@ -625,19 +635,17 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           }
 
           const streamGen = await executeWithRetry(
-            () => config.getContentGenerator().generateContentStream(
+            () => config.getGeminiClient().rawGenerateContentStream(
+              contents,
               {
-                model,
-                contents: contents as any, // Cast to any to avoid potential type mismatches between SDK versions
-                config: {
-                  temperature,
-                  topP,
-                  maxOutputTokens,
-                  ...(tools && { tools: tools as any }),
-                  ...(systemInstruction && { systemInstruction: systemInstruction as any }),
-                }
+                temperature,
+                topP,
+                maxOutputTokens,
+                ...(tools && { tools: tools as any }),
+                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
               },
-              requestId // prompt_id
+              new AbortController().signal,
+              model
             ),
             requestId,
             model
@@ -911,19 +919,17 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         }
 
         const response = await executeWithRetry(
-          () => config.getContentGenerator().generateContent(
+          () => config.getGeminiClient().rawGenerateContent(
+            contents,
             {
-                model,
-                contents: contents as any,
-                config: {
-                  temperature,
-                  topP,
-                  maxOutputTokens,
-                  ...(tools && { tools: tools as any }),
-                  ...(systemInstruction && { systemInstruction: systemInstruction as any }),
-                }
+                temperature,
+                topP,
+                maxOutputTokens,
+                ...(tools && { tools: tools as any }),
+                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
             },
-            requestId
+            new AbortController().signal,
+            model
           ),
           requestId,
           model

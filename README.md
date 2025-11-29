@@ -18,7 +18,7 @@ Start the server:
 gemini-cli-anthropic
 ```
 
-The server will start on port 3000 (configurable via `PORT` environment variable).
+The server will start on port 41242  (configurable via `PORT` environment variable).
 
 ### Install from Source
 
@@ -61,7 +61,7 @@ cd ..
 npm start
 ```
 
-The server will listen on port 3000 by default (configurable via `PORT` environment variable).
+The server will listen on port 41242  by default (configurable via `PORT` environment variable).
 
 ## Authentication
 
@@ -71,7 +71,7 @@ Alternatively, you can use a Gemini API key by setting the `GEMINI_API_KEY` envi
 
 ### Environment Variables
 
-- `PORT`: Server port (default: 3000)
+- `PORT`: Server port (default: 41242 )
 - `GEMINI_API_KEY`: Your Google Gemini API key. If provided, this will be used for authentication instead of the default GCP method.
 - `GOOGLE_APPLICATION_CREDENTIALS`: Path to your Google Cloud credentials file (if needed).
 - `DEBUG_LOG`: Set to `true` to enable detailed request/response logging.
