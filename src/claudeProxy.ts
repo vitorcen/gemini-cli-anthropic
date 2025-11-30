@@ -690,18 +690,21 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           }
 
           const streamGen = await executeWithRetry(
-            () => config.getGeminiClient().rawGenerateContentStream(
-              contents,
-              {
-                temperature,
-                topP,
-                maxOutputTokens,
-                ...(tools && { tools: tools as any }),
-                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
-              },
-              new AbortController().signal,
-              model
-            ),
+            async () => {
+              const client = config.getGeminiClient() as any;
+              return client.rawGenerateContentStream(
+                contents,
+                {
+                  temperature,
+                  topP,
+                  maxOutputTokens,
+                  ...(tools && { tools: tools as any }),
+                  ...(systemInstruction && { systemInstruction: systemInstruction as any }),
+                },
+                new AbortController().signal,
+                model
+              ) as Promise<AsyncGenerator<any>>;
+            },
             requestId,
             model
           );
@@ -998,18 +1001,21 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         }
 
         const response = await executeWithRetry(
-          () => config.getGeminiClient().rawGenerateContent(
-            contents,
-            {
-                temperature,
-                topP,
-                maxOutputTokens,
-                ...(tools && { tools: tools as any }),
-                ...(systemInstruction && { systemInstruction: systemInstruction as any }),
-            },
-            new AbortController().signal,
-            model
-          ),
+          async () => {
+            const client = config.getGeminiClient() as any;
+            return client.rawGenerateContent(
+              contents,
+              {
+                  temperature,
+                  topP,
+                  maxOutputTokens,
+                  ...(tools && { tools: tools as any }),
+                  ...(systemInstruction && { systemInstruction: systemInstruction as any }),
+              },
+              new AbortController().signal,
+              model
+            ) as Promise<any>;
+          },
           requestId,
           model
         );

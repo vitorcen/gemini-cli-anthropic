@@ -1,9 +1,9 @@
-import { GeminiClient } from '@google/gemini-cli-core';
+import { GeminiClient } from '../../gemini-cli/packages/core/src/core/client.js';
 import type { Content, GenerateContentConfig, GenerateContentResponse } from '@google/genai';
 
 export function applyClientPatch() {
   // Monkey-patch rawGenerateContentStream to pass abortSignal
-  GeminiClient.prototype.rawGenerateContentStream = async function*(
+  (GeminiClient.prototype as any).rawGenerateContentStream = async function*(
     contents: Content[],
     config: GenerateContentConfig,
     abortSignal: AbortSignal,
@@ -31,7 +31,7 @@ export function applyClientPatch() {
   };
 
   // Monkey-patch rawGenerateContent to pass abortSignal
-  GeminiClient.prototype.rawGenerateContent = async function(
+  (GeminiClient.prototype as any).rawGenerateContent = async function(
     contents: Content[],
     config: GenerateContentConfig,
     abortSignal: AbortSignal,
