@@ -196,7 +196,7 @@ export function filterThoughtParts(parts: any[]): any[] {
     });
 }
 
-export function logThoughtParts(parts: any[], requestId: string, phase: 'stream' | 'non-stream', forceLog = false): void {
+export function logThoughtParts(parts: any[], requestId: string, phase: 'stream' | 'non-stream' | 'stream-fallback', forceLog = false): void {
   if (!process.env['TEXT_LOG']) return;
 
   const thoughtBlocks = forceLog ? parts : parts.filter(p => {

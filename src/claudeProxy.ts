@@ -172,7 +172,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               const toolName = toolId ? (toolUseMap.get(toolId) ?? block.name) : block.name;
               const resolvedName = toolName || 'unknown';
               const rawContent = block.content;
-              let resultPayload: { result: unknown };
+              let resultPayload: { result: unknown; _notice?: string };
               if (typeof rawContent === 'string') {
                 resultPayload = { result: rawContent };
               } else {
