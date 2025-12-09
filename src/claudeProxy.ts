@@ -643,15 +643,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         // @ts-ignore
         res.flushHeaders && res.flushHeaders();
 
-        // Track client aborts (e.g. user presses Esc) to stop forwarding partial responses
-        let aborted = false;
         let keepAliveInterval: NodeJS.Timeout | undefined;
-        const handleAbort = () => {
-          aborted = true;
-        };
-        req.on('aborted', handleAbort);
-        req.on('close', handleAbort);
-        res.on('close', handleAbort);
 
         try {
           // Use ContentGenerator directly to bypass Turn logic
@@ -733,6 +725,9 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             currentBlockType = null;
           };
 
+          let accumulatedText = '';
+          let messageStartSent = false;
+
           const startTextBlock = () => {
             if (currentBlockType === 'text') return;
             stopCurrentBlock();
@@ -745,27 +740,10 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             });
           };
 
-          let accumulatedText = '';
-          let messageStartSent = false;
-
-          // Setup keep-alive to prevent timeouts during long thinking phases
-          keepAliveInterval = setInterval(() => {
-            if (!aborted && !res.writableEnded) {
-              res.write(': keep-alive\n\n');
-            }
-          }, 10000); // Send keep-alive every 10s
-
           const debugChunks: any[] = [];
           let thoughtLogged = false;
 
           for await (const chunkResp of streamGen) {
-            if (aborted) {
-              // Stop generating further content once the client disconnects
-              if (typeof streamGen.return === 'function') {
-                try { await streamGen.return(undefined as any); } catch { /* ignore */ }
-              }
-              break;
-            }
             // Collect chunks for debug logging
             if (process.env['DEBUG_LOG']) {
               debugChunks.push(chunkResp);
@@ -782,10 +760,8 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             }
 
             // Send message_start on first chunk (with whatever token info we have)
-            if (!messageStartSent && firstChunk) {
+            if (!messageStartSent) {
               messageStartSent = true;
-              firstChunk = false;
-
               writeEvent('message_start', {
                 type: 'message_start',
                 message: {
@@ -861,42 +837,6 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           stopCurrentBlock();
 
-          // If client aborted, skip sending completion events; just exit quietly
-          if (aborted) {
-            // Only log as info if it's actually unexpected, otherwise debug
-            logger.debug(`[${requestId}] Stream aborted by client; skipping message_stop`);
-            await writeDebugLog(requestId, 'stream', {
-              request: {
-                contents,
-                config: {
-                  temperature,
-                  topP,
-                  maxOutputTokens,
-                  tools,
-                  systemInstruction,
-                },
-                model,
-              },
-              response: {
-                chunks: debugChunks,
-                accumulatedText,
-                usage: {
-                  inputTokens,
-                  outputTokens,
-                  thinkingTokens,
-                  totalTokens: sumTokenCounts(inputTokens, outputTokens, thinkingTokens),
-                },
-                aborted: true,
-              },
-            });
-            return res.end();
-          }
-
-          // Remove abort listeners to prevent false positives during cleanup
-          req.off('aborted', handleAbort);
-          req.off('close', handleAbort);
-          res.off('close', handleAbort);
-
           writeEvent('message_delta', {
             type: 'message_delta',
             delta: { stop_reason: 'end_turn', stop_sequence: null },
@@ -950,20 +890,36 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           return res.end();
         } catch (err) {
           const errorMsg = (err as Error).message || 'Stream error';
-          res.write(`event: error\n`);
-          res.write(`data: ${JSON.stringify({
-            type: 'error',
-            error: {
-              type: 'api_error',
-              message: errorMsg,
-            },
-          })}\n\n`);
-          return res.end();
+          logger.error(`[${requestId}] Stream request failed: ${errorMsg}`, err);
+          if (process.env['DEBUG_LOG']) {
+            await writeDebugLog(requestId, 'stream-error', {
+              request: {
+                contents,
+                config: {
+                  temperature,
+                  topP,
+                  maxOutputTokens,
+                  tools,
+                  systemInstruction,
+                },
+                model,
+              },
+              error: {
+                message: errorMsg,
+                name: (err as Error).name,
+                stack: (err as Error).stack,
+              },
+            });
+          }
+          if (!res.headersSent) {
+            res.status(502);
+            res.setHeader('Content-Type', 'application/json');
+          } else {
+            res.statusCode = 502;
+          }
+          return res.end(JSON.stringify({ error: 'stream_failed', message: errorMsg }));
         } finally {
           clearInterval(keepAliveInterval);
-          req.off('aborted', handleAbort);
-          req.off('close', handleAbort);
-          res.off('close', handleAbort);
         }
       } else {
         // Non-streaming response
