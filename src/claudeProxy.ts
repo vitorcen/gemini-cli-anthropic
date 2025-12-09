@@ -17,6 +17,7 @@ const SYNTHETIC_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
 const MAX_RETRIES = 5;
 const BASE_RETRY_DELAY_MS = 1000;
+const MIN_THOUGHT_LOG_CHARS = 40;
 
 async function executeWithRetry<T>(
   operation: () => Promise<T>, 
@@ -36,7 +37,7 @@ async function executeWithRetry<T>(
                            message.includes('429') ||
                            (message.includes('400') && message.includes('capacity'));
 
-      if (process.env['DEBUG_LOG_REQUESTS']) {
+      if (process.env['DEBUG_LOG']) {
         try {
           const logDir = '/tmp/gemini-cli-anthropic';
           try { await fs.mkdir(logDir, { recursive: true }); } catch {}
@@ -282,7 +283,7 @@ function logThoughtParts(parts: any[], requestId: string, phase: 'stream' | 'non
   const combinedText = textParts.join(' ');
 
   if (!combinedText.trim()) {
-    if (forceLog) logger.info(`[${requestId}] TEXT_LOG (Whitespace-only thought chunk)`);
+    // if (forceLog) logger.info(`[${requestId}] TEXT_LOG (Whitespace-only thought chunk)`);
     return;
   }
 
@@ -292,6 +293,11 @@ function logThoughtParts(parts: any[], requestId: string, phase: 'stream' | 'non
 
   if (displayedText.length > 200) {
     displayedText = `${displayedText.slice(0, 130)}...${displayedText.slice(-70)}`;
+  }
+
+  // Avoid noisy logs for tiny fragments; wait for a meaningful chunk.
+  if (displayedText.length < MIN_THOUGHT_LOG_CHARS) {
+    return;
   }
 
   logger.info(`[${requestId}] TEXT_LOG ${displayedText}`);
@@ -530,7 +536,18 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
       const unprocessedContents: Content[] = [];
       const toolUseMap = new Map<string, string>(); // tool_use_id -> name
 
-      for (const message of body.messages) {
+      for (let idx = 0; idx < body.messages.length; idx++) {
+        const message = body.messages[idx];
+        
+        // // Skip prior model messages that explicitly said "No response requested."
+        // if (
+        //   message.role === 'assistant' &&
+        //   typeof message.content === 'string' &&
+        //   message.content.trim().toLowerCase() === 'no response requested.'
+        // ) {
+        //   continue;
+        // }
+
         if (typeof message.content === 'string') {
           // Simple text message
           unprocessedContents.push({
@@ -579,8 +596,25 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
               const toolId = block.tool_use_id || (block as any).tool_id;
               const toolName = toolId ? (toolUseMap.get(toolId) ?? block.name) : block.name;
               const resolvedName = toolName || 'unknown';
-              const resultPayload =
-                typeof block.content === 'string' ? { result: block.content } : { result: block.content };
+              const rawContent = block.content;
+              let resultPayload: { result: unknown };
+              if (typeof rawContent === 'string') {
+                resultPayload = { result: rawContent };
+              } else {
+                // Ensure the payload is JSON-serializable; fall back to plain text if not.
+                try {
+                  JSON.stringify(rawContent);
+                  resultPayload = { result: rawContent };
+                } catch {
+                  logger.warn(
+                    `[${requestId}] tool_result for "${resolvedName}" was not JSON-serializable; applied safeStringify fallback`,
+                  );
+                  resultPayload = {
+                    result: safeStringify(rawContent),
+                    _notice: 'tool_result was stringified because it was not JSON-serializable',
+                  };
+                }
+              }
               parts.push({
                 functionResponse: {
                   name: resolvedName,
@@ -647,13 +681,14 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
         try {
           // Use ContentGenerator directly to bypass Turn logic
-          const textSizeKB = (Buffer.byteLength(JSON.stringify(contents), 'utf8') / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+          const requestBytes = Buffer.byteLength(JSON.stringify(contents), 'utf8');
+          const textSizeKB = (requestBytes / 1024).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
           logger.info(
             `[${requestId}] Sending request model=${model} stream=true text=${textSizeKB}KB`,
           );
 
-          // Log request details if DEBUG_LOG_REQUESTS is set
-          if (process.env['DEBUG_LOG_REQUESTS']) {
+          // Log request details if DEBUG_LOG is set
+          if (process.env['DEBUG_LOG']) {
             try {
               const logDir = '/tmp/gemini-cli-anthropic';
               try { await fs.mkdir(logDir, { recursive: true }); } catch {}
@@ -705,6 +740,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           let inputTokens = 0;
           let thinkingTokens = 0;
           let firstChunk = true;
+          let lastFinishReason: string | undefined;
           
           const writeEvent = (event: string, data: object) => {
             res.write(`event: ${event}\n`);
@@ -742,8 +778,11 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           const debugChunks: any[] = [];
           let thoughtLogged = false;
+          let receivedAnyChunk = false;
+          let emittedFunctionCall = false;
 
           for await (const chunkResp of streamGen) {
+            receivedAnyChunk = true;
             // Collect chunks for debug logging
             if (process.env['DEBUG_LOG']) {
               debugChunks.push(chunkResp);
@@ -757,6 +796,10 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
                 // Check for thinking tokens in various possible fields
                 const thoughtCount = usage.thoughtsTokenCount ?? usage.thoughts_token_count ?? usage.thinking_token_count;
                 if (thoughtCount !== undefined) thinkingTokens = thoughtCount;
+            }
+            const finish = (chunkResp as any)?.candidates?.[0]?.finishReason;
+            if (finish) {
+              lastFinishReason = finish;
             }
 
             // Send message_start on first chunk (with whatever token info we have)
@@ -814,6 +857,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
             if (functionCalls && functionCalls.length > 0) {
               for (const part of functionCalls) {
                 if (part.functionCall) {
+                  emittedFunctionCall = true;
                   stopCurrentBlock();
                   currentContentIndex++;
                   currentBlockType = 'tool_use';
@@ -832,6 +876,193 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
                   stopCurrentBlock();
                 }
               }
+            }
+          }
+
+          const shouldFallbackDueToEmpty = !receivedAnyChunk;
+          const shouldFallbackDueToTinyResponse =
+             receivedAnyChunk &&
+             !emittedFunctionCall &&
+             accumulatedText.trim().length < 50 &&
+             outputTokens <= 32 &&
+             (requestBytes > 12 * 1024 || inputTokens > 512) &&
+             // Only fallback if the model did NOT signal a clean stop
+             lastFinishReason !== 'STOP' &&
+             lastFinishReason !== 'STOPPING' &&
+             lastFinishReason !== 'FINISH_REASON_UNSPECIFIED';
+
+          const shouldFallbackDueToMissingUsage =
+             receivedAnyChunk &&
+             outputTokens === 0 &&
+             inputTokens === 0 &&
+             lastFinishReason === undefined &&
+             accumulatedText.trim().length > 0 &&
+             requestBytes > 12 * 1024;
+
+          const shouldFallbackDueToTruncatedStop =
+            receivedAnyChunk &&
+            !emittedFunctionCall &&
+            accumulatedText.trim().length > 0 &&
+            accumulatedText.trim().length < 200 &&
+            requestBytes > 20 * 1024 &&
+            lastFinishReason === 'STOP';
+
+          // Fallback: upstream stream returned zero chunks or tiny/early-stop text; retry once with non-stream and stream the result to avoid a second user call.
+          if (shouldFallbackDueToEmpty || shouldFallbackDueToTinyResponse || shouldFallbackDueToMissingUsage || shouldFallbackDueToTruncatedStop) {
+            const reason = shouldFallbackDueToEmpty
+              ? 'no chunks'
+              : shouldFallbackDueToTinyResponse
+              ? `tiny response (${accumulatedText.length} chars) without clean stop`
+              : shouldFallbackDueToMissingUsage
+              ? 'missing usage metadata'
+              : `suspiciously short response (${accumulatedText.length} chars) despite STOP reason`;
+
+            logger.warn(
+              `[${requestId}] Stream fallback triggered: ${reason}; falling back to non-stream in the same request`,
+            );
+            try {
+              // Close any open block before retrying
+              stopCurrentBlock();
+
+              const fallbackResponse = await executeWithRetry(
+                async () => {
+                  const client = config.getGeminiClient() as any;
+                  return client.rawGenerateContent(
+                    contents,
+                    {
+                      temperature,
+                      topP,
+                      maxOutputTokens,
+                      ...(tools && { tools: tools as any }),
+                      ...(systemInstruction && { systemInstruction: systemInstruction as any }),
+                    },
+                    new AbortController().signal,
+                    model
+                  ) as Promise<any>;
+                },
+                requestId,
+                model
+              );
+
+              const usage = (fallbackResponse as any).usageMetadata || (fallbackResponse as any).usage_metadata;
+              const prompt = usage?.promptTokenCount ?? usage?.prompt_token_count ?? 0;
+              const candidates = usage?.candidatesTokenCount ?? usage?.candidates_token_count ?? 0;
+              const thinking = usage?.thoughtsTokenCount ?? usage?.thoughts_token_count ?? usage?.thinking_token_count ?? 0;
+
+              const rawParts = fallbackResponse.candidates?.[0]?.content?.parts || [];
+              logThoughtParts(rawParts, requestId, 'stream-fallback');
+              const parts = filterThoughtParts(rawParts);
+
+              // If we already started the message, continue appending; otherwise start fresh.
+              if (!messageStartSent) {
+                messageStartSent = true;
+                currentContentIndex = -1;
+                writeEvent('message_start', {
+                  type: 'message_start',
+                  message: {
+                    id: messageId,
+                    type: 'message',
+                    role: 'assistant',
+                    model,
+                    content: [],
+                    stop_reason: null,
+                    stop_sequence: null,
+                    usage: { input_tokens: prompt, output_tokens: 0 },
+                  },
+                });
+              }
+
+              for (const part of parts) {
+                if ((part as any).text && !(part as any).functionCall) {
+                  currentContentIndex++;
+                  writeEvent('content_block_start', {
+                    type: 'content_block_start',
+                    index: currentContentIndex,
+                    content_block: { type: 'text', text: '' },
+                  });
+                  writeEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: currentContentIndex,
+                    delta: { type: 'text_delta', text: (part as any).text },
+                  });
+                  writeEvent('content_block_stop', {
+                    type: 'content_block_stop',
+                    index: currentContentIndex,
+                  });
+                } else if ((part as any).functionCall) {
+                  const fc = (part as any).functionCall;
+                  currentContentIndex++;
+                  const toolId = `toolu_${uuidv4()}`;
+                  const serializedArgs = serializeArgsForSse(fc.args ?? {});
+                  writeEvent('content_block_start', {
+                    type: 'content_block_start',
+                    index: currentContentIndex,
+                    content_block: { type: 'tool_use', id: toolId, name: fc.name, input: {} },
+                  });
+                  writeEvent('content_block_delta', {
+                    type: 'content_block_delta',
+                    index: currentContentIndex,
+                    delta: { type: 'input_json_delta', partial_json: serializedArgs },
+                  });
+                  writeEvent('content_block_stop', {
+                    type: 'content_block_stop',
+                    index: currentContentIndex,
+                  });
+                }
+              }
+
+              writeEvent('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: 'end_turn', stop_sequence: null },
+                usage: {
+                  output_tokens: candidates,
+                  thinking_tokens: thinking
+                },
+              });
+
+              const totalTokens = sumTokenCounts(prompt, candidates, thinking);
+              const promptStr = `prompt=${formatTokenCount(prompt)}`;
+              const thinkingStr = ` thinking=${formatTokenCount(thinking)}`;
+              const outputStr = `output=${formatTokenCount(candidates)}`;
+              const totalStr = `total=${formatTokenCount(totalTokens)}`;
+
+              logger.info(
+                `[${requestId}] model=${model} usage: ${promptStr}${thinkingStr} ${outputStr} ${totalStr} tokens (stream fallback)`,
+              );
+
+              res.write(`event: message_stop\n`);
+              res.write(`data: ${JSON.stringify({
+                type: 'message_stop',
+              })}\n\n`);
+
+              if (process.env['DEBUG_LOG']) {
+                await writeDebugLog(requestId, 'stream-fallback', {
+                  request: {
+                    contents,
+                    config: {
+                      temperature,
+                      topP,
+                      maxOutputTokens,
+                      tools,
+                      systemInstruction,
+                    },
+                    model,
+                  },
+                  response: {
+                    raw: fallbackResponse,
+                    usage: {
+                      prompt,
+                      candidates,
+                      thinking,
+                      totalTokens,
+                    },
+                  },
+                });
+              }
+
+              return res.end();
+            } finally {
+              clearInterval(keepAliveInterval);
             }
           }
 
@@ -890,7 +1121,22 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           return res.end();
         } catch (err) {
           const errorMsg = (err as Error).message || 'Stream error';
-          logger.error(`[${requestId}] Stream request failed: ${errorMsg}`, err);
+          const normalized = errorMsg.toLowerCase();
+          const isQuota =
+            normalized.includes('quota') ||
+            normalized.includes('capacity') ||
+            normalized.includes('resource has been exhausted') ||
+            normalized.includes('rate') ||
+            normalized.includes('429');
+          if (isQuota) {
+            logger.warn(
+              `[${requestId}] Stream request failed (quota): ${errorMsg}`,
+            );
+          } else {
+            logger.error(
+              `[${requestId}] Stream request failed: ${errorMsg}`,
+            );
+          }
           if (process.env['DEBUG_LOG']) {
             await writeDebugLog(requestId, 'stream-error', {
               request: {
@@ -928,8 +1174,8 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           `[${requestId}] Sending request model=${model} stream=false text=${textSizeKB}KB`,
         );
 
-        // Log request details if DEBUG_LOG_REQUESTS is set
-        if (process.env['DEBUG_LOG_REQUESTS']) {
+        // Log request details if DEBUG_LOG is set
+        if (process.env['DEBUG_LOG']) {
           try {
             const logDir = '/tmp/gemini-cli-anthropic';
             try { await fs.mkdir(logDir, { recursive: true }); } catch {}
