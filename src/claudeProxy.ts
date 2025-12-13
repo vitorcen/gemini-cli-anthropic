@@ -253,6 +253,20 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
         res.flushHeaders && res.flushHeaders();
 
         let keepAliveInterval: NodeJS.Timeout | undefined;
+        const abortController = new AbortController();
+        let clientAborted = false;
+        const abortSignal = abortController.signal;
+        let streamCompleted = false;
+
+        const handleClientAbort = () => {
+          if (streamCompleted) return;
+          if (clientAborted) return;
+          clientAborted = true;
+          abortController.abort();
+        };
+
+        // Use 'aborted' as the signal that the client actively canceled.
+        req.on('aborted', handleClientAbort);
 
         try {
           // Use ContentGenerator directly to bypass Turn logic
@@ -303,7 +317,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
                   ...(tools && { tools: tools as any }),
                   ...(systemInstruction && { systemInstruction: systemInstruction as any }),
                 },
-                new AbortController().signal,
+                abortSignal,
                 model
               ) as Promise<AsyncGenerator<any>>;
             },
@@ -318,6 +332,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           let lastFinishReason: string | undefined;
 
           const writeEvent = (event: string, data: object) => {
+            if (clientAborted || res.writableEnded) return;
             res.write(`event: ${event}\n`);
             res.write(`data: ${JSON.stringify(data)}\n\n`);
           };
@@ -357,6 +372,16 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           let emittedFunctionCall = false;
 
           for await (const chunkResp of streamGen) {
+            if (abortSignal.aborted || clientAborted) {
+              if (!streamCompleted) {
+                logger.info(`[${requestId}] Stream aborted by client; stopping chunk consumption.`);
+              }
+              stopCurrentBlock();
+              // Gracefully end SSE; guard writes if client already closed.
+              writeEvent('message_stop', { type: 'message_stop' });
+              res.end();
+              return;
+            }
             receivedAnyChunk = true;
             // Collect chunks for debug logging
             if (process.env['DEBUG_LOG']) {
@@ -657,6 +682,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           res.write(`data: ${JSON.stringify({
             type: 'message_stop',
           })}\n\n`);
+          streamCompleted = true;
 
           // Write debug log
           await writeDebugLog(requestId, 'stream', {
@@ -685,6 +711,11 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
 
           return res.end();
         } catch (err) {
+          if ((abortSignal.aborted || clientAborted) && !streamCompleted) {
+            logger.info(`[${requestId}] Stream request aborted by client.`);
+            return;
+          }
+
           const errorMsg = (err as Error).message || 'Stream error';
           const normalized = errorMsg.toLowerCase();
           const isQuota =
@@ -730,6 +761,7 @@ export function registerClaudeEndpoints(app: express.Router, defaultConfig: Conf
           }
           return res.end(JSON.stringify({ error: 'stream_failed', message: errorMsg }));
         } finally {
+          req.off('aborted', handleClientAbort);
           clearInterval(keepAliveInterval);
         }
       } else {
