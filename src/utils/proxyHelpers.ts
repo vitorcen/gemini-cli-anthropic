@@ -127,7 +127,37 @@ export function cleanSchema(schema: any): any {
   if (!schema || typeof schema !== 'object') return schema;
 
   // Remove JSON Schema metadata fields
-  const { $schema, $id, $ref, $comment, definitions, $defs, ...rest } = schema;
+  const rest: Record<string, any> = { ...schema };
+  delete rest.$schema;
+  delete rest.$id;
+  delete rest.$ref;
+  delete rest.$comment;
+  delete rest.definitions;
+  delete rest.$defs;
+
+  // Gemini API rejects exclusiveMinimum/exclusiveMaximum; map to min/max when possible.
+  if (typeof rest.exclusiveMinimum === 'number') {
+    const exclusiveMin = rest.exclusiveMinimum;
+    delete rest.exclusiveMinimum;
+    if (typeof rest.minimum !== 'number') {
+      rest.minimum = rest.type === 'integer' ? exclusiveMin + 1 : exclusiveMin;
+    } else if (rest.type === 'integer') {
+      rest.minimum = Math.max(rest.minimum, exclusiveMin + 1);
+    } else {
+      rest.minimum = Math.max(rest.minimum, exclusiveMin);
+    }
+  }
+  if (typeof rest.exclusiveMaximum === 'number') {
+    const exclusiveMax = rest.exclusiveMaximum;
+    delete rest.exclusiveMaximum;
+    if (typeof rest.maximum !== 'number') {
+      rest.maximum = rest.type === 'integer' ? exclusiveMax - 1 : exclusiveMax;
+    } else if (rest.type === 'integer') {
+      rest.maximum = Math.min(rest.maximum, exclusiveMax - 1);
+    } else {
+      rest.maximum = Math.min(rest.maximum, exclusiveMax);
+    }
+  }
 
   // Recursively clean nested objects
   const cleaned: any = {};
